@@ -75,17 +75,18 @@ module cmpct_source_pipe #(
     wire                      beat_tvalid;
     wire                      beat_tready;
 
-    wire [7:0]                byte_tdata;
-    wire [0:0]                byte_tkeep;
-    wire                      byte_tlast;
-    wire                      byte_tvalid;
-    wire                      byte_tready;
+    // P9: 64-bit intermediate path (8 bytes/cycle)
+    wire [63:0]               word_tdata;
+    wire [7:0]                word_tkeep;
+    wire                      word_tlast;
+    wire                      word_tvalid;
+    wire                      word_tready;
 
-    wire [7:0]                aligned_byte_tdata;
-    wire [0:0]                aligned_byte_tkeep;
-    wire                      aligned_byte_tlast;
-    wire                      aligned_byte_tvalid;
-    wire                      aligned_byte_tready;
+    wire [63:0]               aligned_word_tdata;
+    wire [7:0]                aligned_word_tkeep;
+    wire                      aligned_word_tlast;
+    wire                      aligned_word_tvalid;
+    wire                      aligned_word_tready;
 
     wire rd_busy;
     wire rd_error;
@@ -146,11 +147,12 @@ module cmpct_source_pipe #(
         .m_axis_tready(beat_tready)
     );
 
+    // P9: 512→64 width adapter (8 bytes/cycle output)
     stream_width_adapter #(
         .IN_DATA_WIDTH(AXI_DATA_WIDTH),
         .IN_KEEP_WIDTH(AXI_KEEP_WIDTH),
-        .OUT_DATA_WIDTH(8),
-        .OUT_KEEP_WIDTH(1)
+        .OUT_DATA_WIDTH(64),
+        .OUT_KEEP_WIDTH(8)
     ) u_stream_width_adapter (
         .clk(clk),
         .rstn(rstn),
@@ -160,33 +162,35 @@ module cmpct_source_pipe #(
         .s_axis_tlast(beat_tlast),
         .s_axis_tvalid(beat_tvalid),
         .s_axis_tready(beat_tready),
-        .m_axis_tdata(byte_tdata),
-        .m_axis_tkeep(byte_tkeep),
-        .m_axis_tlast(byte_tlast),
-        .m_axis_tvalid(byte_tvalid),
-        .m_axis_tready(byte_tready)
+        .m_axis_tdata(word_tdata),
+        .m_axis_tkeep(word_tkeep),
+        .m_axis_tlast(word_tlast),
+        .m_axis_tvalid(word_tvalid),
+        .m_axis_tready(word_tready)
     );
 
-    byte_skip_adapter #(
+    // P9: 64-bit byte skip adapter
+    byte_skip_adapter_w64 #(
         .SKIP_WIDTH(AXI_BEAT_SHIFT)
-    ) u_byte_skip_adapter (
+    ) u_byte_skip_adapter_w64 (
         .clk(clk),
         .rstn(rstn),
         .clear(clear),
         .start(start),
         .skip_bytes(align_offset_w),
-        .s_axis_tdata(byte_tdata),
-        .s_axis_tkeep(byte_tkeep),
-        .s_axis_tlast(byte_tlast),
-        .s_axis_tvalid(byte_tvalid),
-        .s_axis_tready(byte_tready),
-        .m_axis_tdata(aligned_byte_tdata),
-        .m_axis_tkeep(aligned_byte_tkeep),
-        .m_axis_tlast(aligned_byte_tlast),
-        .m_axis_tvalid(aligned_byte_tvalid),
-        .m_axis_tready(aligned_byte_tready)
+        .s_axis_tdata(word_tdata),
+        .s_axis_tkeep(word_tkeep),
+        .s_axis_tlast(word_tlast),
+        .s_axis_tvalid(word_tvalid),
+        .s_axis_tready(word_tready),
+        .m_axis_tdata(aligned_word_tdata),
+        .m_axis_tkeep(aligned_word_tkeep),
+        .m_axis_tlast(aligned_word_tlast),
+        .m_axis_tvalid(aligned_word_tvalid),
+        .m_axis_tready(aligned_word_tready)
     );
 
+    // P9: Decoder now accepts 64-bit input (8 bytes/cycle capture)
     cmpct_block_decoder #(
         .MAX_BLOCK_BYTES(MAX_BLOCK_BYTES),
         .MAX_KEY_BYTES(MAX_KEY_BYTES)
@@ -196,11 +200,11 @@ module cmpct_source_pipe #(
         .clear(clear),
         .start(dec_start_w),
         .block_byte_count(byte_count),   // OPT-3A: pass block size for streaming parse
-        .s_axis_tdata(aligned_byte_tdata),
-        .s_axis_tkeep(aligned_byte_tkeep),
-        .s_axis_tlast(aligned_byte_tlast),
-        .s_axis_tvalid(aligned_byte_tvalid),
-        .s_axis_tready(aligned_byte_tready),
+        .s_axis_tdata(aligned_word_tdata),
+        .s_axis_tkeep(aligned_word_tkeep),
+        .s_axis_tlast(aligned_word_tlast),
+        .s_axis_tvalid(aligned_word_tvalid),
+        .s_axis_tready(aligned_word_tready),
         .busy(dec_busy),
         .done(dec_done),
         .error(dec_error),

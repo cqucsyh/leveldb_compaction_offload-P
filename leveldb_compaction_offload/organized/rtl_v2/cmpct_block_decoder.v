@@ -9,8 +9,9 @@ module cmpct_block_decoder #(
     input  wire        clear,
     input  wire        start,
     input  wire [31:0] block_byte_count,  // OPT-3A: externally provided block size
-    input  wire [7:0]  s_axis_tdata,
-    input  wire [0:0]  s_axis_tkeep,
+    // P9: 64-bit wide input (8 bytes/cycle capture)
+    input  wire [63:0] s_axis_tdata,
+    input  wire [7:0]  s_axis_tkeep,
     input  wire        s_axis_tlast,
     input  wire        s_axis_tvalid,
     output wire        s_axis_tready,
@@ -119,28 +120,56 @@ module cmpct_block_decoder #(
     // OPT-D3: 4 bytes emitted per cycle — remaining byte count in current phase
     reg  [31:0] emit_remain;      // bytes remaining in current emit phase
 
-    // ---- BRAM via 8-bank interleaved cmpct_sdpram (P3) ----
+    // ---- BRAM via 8-bank interleaved cmpct_sdpram (P3/P9) ----
     // Each bank stores every 8th byte: bank[b] stores addresses where addr[2:0]==b.
-    // Write: 1 byte/cycle into bank cap_wptr[2:0] at word address cap_wptr>>3.
+    // P9: Write up to 8 bytes/cycle from 64-bit input, routing by cap_wptr alignment.
     // Read:  all 8 banks in parallel → 8 bytes/cycle.
     //        For parse (single byte): read all banks at parse_addr>>3, mux by parse_addr[2:0].
     //        For emit (8 bytes):      each bank gets its own address based on emit base.
     localparam BMEM_WORD_AW = (BMEM_AW > 3) ? (BMEM_AW - 3) : 1;
 
-    wire        bram_we_comb = s_axis_tvalid && s_axis_tkeep[0] && s_axis_tready;
+    // P9: Count valid bytes in input beat (popcount of tkeep)
+    wire [3:0] s_axis_byte_count = {3'b0, s_axis_tkeep[0]} + {3'b0, s_axis_tkeep[1]}
+                                 + {3'b0, s_axis_tkeep[2]} + {3'b0, s_axis_tkeep[3]}
+                                 + {3'b0, s_axis_tkeep[4]} + {3'b0, s_axis_tkeep[5]}
+                                 + {3'b0, s_axis_tkeep[6]} + {3'b0, s_axis_tkeep[7]};
+
+    wire        bram_we_comb = s_axis_tvalid && (s_axis_tkeep != 8'd0) && s_axis_tready;
     wire        entries_done_w = ra_valid && (parse_index >= ra_offset_r);
     wire        varint_overflow_w = (varint_shift >= 6'd28) || (varint_bytes == 3'd4);
 
-    // Per-bank write enables
+    // P9: Per-bank write enables — up to 8 banks written simultaneously.
+    // Bank b is written if input byte at position ((b - cap_wptr[2:0]) & 7) is valid.
+    wire [2:0] cap_offset = cap_wptr[2:0];
     wire [7:0] bank_we;
-    assign bank_we[0] = bram_we_comb && (cap_wptr[2:0] == 3'd0);
-    assign bank_we[1] = bram_we_comb && (cap_wptr[2:0] == 3'd1);
-    assign bank_we[2] = bram_we_comb && (cap_wptr[2:0] == 3'd2);
-    assign bank_we[3] = bram_we_comb && (cap_wptr[2:0] == 3'd3);
-    assign bank_we[4] = bram_we_comb && (cap_wptr[2:0] == 3'd4);
-    assign bank_we[5] = bram_we_comb && (cap_wptr[2:0] == 3'd5);
-    assign bank_we[6] = bram_we_comb && (cap_wptr[2:0] == 3'd6);
-    assign bank_we[7] = bram_we_comb && (cap_wptr[2:0] == 3'd7);
+    genvar gwi;
+    generate
+        for (gwi = 0; gwi < 8; gwi = gwi + 1) begin : gen_bank_we
+            // Which input byte position maps to this bank?
+            wire [2:0] byte_pos = (gwi[2:0] - cap_offset) & 3'b111;  // barrel rotation
+            assign bank_we[gwi] = bram_we_comb && s_axis_tkeep[byte_pos];
+        end
+    endgenerate
+
+    // P9: Per-bank write data — route input byte to correct bank
+    wire [7:0] bank_wdata [0:7];
+    generate
+        for (gwi = 0; gwi < 8; gwi = gwi + 1) begin : gen_bank_wdata
+            wire [2:0] byte_pos_w = (gwi[2:0] - cap_offset) & 3'b111;
+            assign bank_wdata[gwi] = s_axis_tdata[byte_pos_w*8 +: 8];
+        end
+    endgenerate
+
+    // P9: Per-bank write address — bank b gets word addr cap_wptr>>3 if b >= cap_offset,
+    //     else (cap_wptr>>3)+1 (the byte wraps to next word)
+    wire [BMEM_WORD_AW-1:0] cap_waddr_base = cap_wptr[BMEM_AW-1:3];
+    wire [BMEM_WORD_AW-1:0] cap_waddr_next = cap_wptr[BMEM_AW-1:3] + {{(BMEM_WORD_AW-1){1'b0}}, 1'b1};
+    wire [BMEM_WORD_AW-1:0] bank_waddr [0:7];
+    generate
+        for (gwi = 0; gwi < 8; gwi = gwi + 1) begin : gen_bank_waddr
+            assign bank_waddr[gwi] = (gwi[2:0] >= cap_offset) ? cap_waddr_base : cap_waddr_next;
+        end
+    endgenerate
 
     // Bank read data outputs
     wire [7:0] bank_rdata [0:7];
@@ -272,21 +301,20 @@ module cmpct_block_decoder #(
         end
     end
 
-    // Instantiate 8 BRAM banks
-    genvar gi;
+    // P9: Instantiate 8 BRAM banks with per-bank write data/address
     generate
-        for (gi = 0; gi < 8; gi = gi + 1) begin : gen_bank
+        for (gwi = 0; gwi < 8; gwi = gwi + 1) begin : gen_bank
             cmpct_sdpram #(
                 .DEPTH ((MAX_BLOCK_BYTES + 7) / 8),
                 .WIDTH (8)
             ) u_block_bank (
                 .clk   (clk),
-                .we    (bank_we[gi]),
-                .waddr (cap_wptr[BMEM_AW-1:3]),
-                .wdata (s_axis_tdata),
-                .re    (bank_re[gi]),
-                .raddr (bank_raddr[gi][BMEM_WORD_AW-1:0]),
-                .rdata (bank_rdata[gi])
+                .we    (bank_we[gwi]),
+                .waddr (bank_waddr[gwi]),
+                .wdata (bank_wdata[gwi]),
+                .re    (bank_re[gwi]),
+                .raddr (bank_raddr[gwi][BMEM_WORD_AW-1:0]),
+                .rdata (bank_rdata[gwi])
             );
         end
     endgenerate
@@ -335,8 +363,11 @@ module cmpct_block_decoder #(
         end
     endfunction
 
-    // OPT-3A: s_axis_tready driven by capture process, not parse FSM
+    // P9: s_axis_tready driven by capture process.
+    // Accept if there's room for at least 1 byte (final beat may be partial with tlast).
+    // Overflow is caught in the capture FSM if cap_wptr + byte_count > MAX without tlast.
     assign s_axis_tready = cap_active && !cap_error && (cap_wptr < MAX_BLOCK_BYTES);
+
     assign current_key_len_w = shared_len + unshared_len;
 
     // P3: 64-bit emit data path (8 bytes/cycle)
@@ -503,7 +534,7 @@ module cmpct_block_decoder #(
             next_varint_value = 32'd0;
             next_fixed32_value = 32'd0;
 
-            // ---- Capture sub-process (writes block_mem, concurrent with parse) ----
+            // ---- P9: Capture sub-process (8 bytes/cycle from 64-bit input) ----
             if (start && !busy) begin
                 cap_wptr     <= 32'd0;
                 cap_done     <= 1'b0;
@@ -518,17 +549,32 @@ module cmpct_block_decoder #(
                                     ? (block_byte_count - RESTART_GUARD[31:0])
                                     : 32'd0;
             end else if (cap_active && !cap_error) begin
-                if (s_axis_tvalid && s_axis_tkeep[0] && s_axis_tready) begin
-                    tail_accum <= {s_axis_tdata, tail_accum[31:8]};
-                    if ((cap_wptr == (MAX_BLOCK_BYTES - 1)) && !s_axis_tlast) begin
+                if (s_axis_tvalid && (s_axis_tkeep != 8'd0) && s_axis_tready) begin
+                    // P9: Update tail_accum with the last 4 bytes of this beat.
+                    // Shift in valid bytes from LSB to MSB order in tail_accum.
+                    // We need the last 4 captured bytes overall — update a sliding
+                    // window by shifting in s_axis_byte_count bytes.
+                    case (s_axis_byte_count)
+                        4'd1: tail_accum <= {s_axis_tdata[7:0],   tail_accum[31:8]};
+                        4'd2: tail_accum <= {s_axis_tdata[15:0],  tail_accum[31:16]};
+                        4'd3: tail_accum <= {s_axis_tdata[23:0],  tail_accum[31:24]};
+                        4'd4: tail_accum <= s_axis_tdata[31:0];
+                        4'd5: tail_accum <= s_axis_tdata[39:8];
+                        4'd6: tail_accum <= s_axis_tdata[47:16];
+                        4'd7: tail_accum <= s_axis_tdata[55:24];
+                        default: tail_accum <= s_axis_tdata[63:32]; // 8 bytes
+                    endcase
+
+                    if ((cap_wptr + {28'd0, s_axis_byte_count} > MAX_BLOCK_BYTES) &&
+                        !s_axis_tlast) begin
                         cap_error  <= 1'b1;
                         cap_active <= 1'b0;
                     end else if (s_axis_tlast) begin
                         cap_done   <= 1'b1;
                         cap_active <= 1'b0;
-                        cap_wptr   <= cap_wptr + 32'd1;
+                        cap_wptr   <= cap_wptr + {28'd0, s_axis_byte_count};
                     end else begin
-                        cap_wptr   <= cap_wptr + 32'd1;
+                        cap_wptr   <= cap_wptr + {28'd0, s_axis_byte_count};
                     end
                 end
             end

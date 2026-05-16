@@ -27,6 +27,7 @@ iverilog -g2012 -Wall -Wno-timescale \
     "$RTL_DIR/cmpct_desc_matcher.v" \
     "$RTL_DIR/stream_byte_packer_32.v" \
     "$RTL_DIR/stream_byte_packer_64.v" \
+    "$RTL_DIR/byte_skip_adapter_w64.v" \
     "$RTL_DIR/cmpct_infra.v" \
     "$RTL_DIR/cmpct_sdpram.v" \
     "$SIM_DIR/../common/axi_ram_model.v"

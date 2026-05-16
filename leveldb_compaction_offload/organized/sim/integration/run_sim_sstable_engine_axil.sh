@@ -26,6 +26,7 @@ iverilog -g2012 -Wall -Wno-timescale \
     "${RTL}/cmpct_desc_matcher.v" \
     "${RTL}/stream_byte_packer_32.v" \
     "${RTL}/stream_byte_packer_64.v" \
+    "${RTL}/byte_skip_adapter_w64.v" \
     2>&1
 
 echo "Compile OK – running simulation..."

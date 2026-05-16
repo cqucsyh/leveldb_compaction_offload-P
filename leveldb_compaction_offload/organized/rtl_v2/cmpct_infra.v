@@ -432,7 +432,7 @@ module axi_read_engine #(
                     next_addr                <= next_addr + ({ {(AXI_ADDR_WIDTH-8){1'b0}}, next_burst_len } << AXI_BEAT_SHIFT);
                 end
 
-                if (m_axi_rvalid && can_take_r) begin
+                if (waiting_for_r && m_axi_rvalid && can_take_r) begin
                     out_data  <= m_axi_rdata;
                     out_keep  <= current_is_last ? final_keep_mask : {AXI_KEEP_WIDTH{1'b1}};
                     out_last  <= current_is_last;
