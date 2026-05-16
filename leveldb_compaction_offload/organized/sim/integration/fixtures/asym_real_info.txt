@@ -1,0 +1,10 @@
+scenario=asym_real
+src0_size=450
+src1_size=1110
+src0_blocks=3
+src1_blocks=8
+src0_records=12
+src1_records=32
+block_pairs=8
+expected_merged=44
+expected_dropped=0

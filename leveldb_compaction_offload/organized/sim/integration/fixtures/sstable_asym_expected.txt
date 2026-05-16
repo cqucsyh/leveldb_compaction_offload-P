@@ -1,0 +1,13 @@
+# src0_asym  base=0x00000000  total_size=523
+sstable_size=523
+block_count=3
+block[0]: abs_addr=0x0000000000000000 size=122
+block[1]: abs_addr=0x000000000000007f size=122
+block[2]: abs_addr=0x00000000000000fe size=122
+
+# src1_asym  base=0x00004000  total_size=313
+sstable_size=313
+block_count=2
+block[0]: abs_addr=0x0000000000004000 size=123
+block[1]: abs_addr=0x0000000000004080 size=63
+

@@ -1,0 +1,24 @@
+#-----------------------------------------------------------
+# Vivado v2025.1 (64-bit)
+# SW Build 6140274 on Wed May 21 22:58:25 MDT 2025
+# IP Build 6138677 on Thu May 22 03:10:11 MDT 2025
+# SharedData Build 6139179 on Tue May 20 17:58:58 MDT 2025
+# Start of session at: Sat Apr 18 15:27:26 2026
+# Process ID         : 1797472
+# Current directory  : /home/yh/pp4/leveldb_compaction_offload/organized/sim/integration
+# Command line       : vivado -mode batch -source /tmp/rebuild_sstable.tcl -log /tmp/rebuild_sstable.log
+# Log file           : /tmp/rebuild_sstable.log
+# Journal file       : /home/yh/pp4/leveldb_compaction_offload/organized/sim/integration/vivado.jou
+# Running On         : haswell
+# Platform           : Debian
+# Operating System   : Debian GNU/Linux 13 (trixie)
+# Processor Detail   : Intel(R) Core(TM) i7-4790 CPU @ 3.60GHz
+# CPU Frequency      : 3671.505 MHz
+# CPU Physical cores : 4
+# CPU Logical cores  : 8
+# Host memory        : 33530 MB
+# Swap memory        : 28802 MB
+# Total Virtual      : 62333 MB
+# Available Virtual  : 45600 MB
+#-----------------------------------------------------------
+source /tmp/rebuild_sstable.tcl

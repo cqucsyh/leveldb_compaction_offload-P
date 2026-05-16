@@ -1,0 +1,13 @@
+src0_size=2012
+src1_size=2012
+src0_base=0x0
+src1_base=0x10000
+src0_blocks=12
+src1_blocks=12
+src0_records=48
+src1_records=48
+duplicate_keys=8
+expected_block_pairs=12
+expected_merge_decoded=96
+expected_merge_merged=88
+expected_merge_dropped=8

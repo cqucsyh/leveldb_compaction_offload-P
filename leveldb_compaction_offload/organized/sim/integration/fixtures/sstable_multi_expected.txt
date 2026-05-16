@@ -1,0 +1,30 @@
+# src0  base=0x00000000  total_size=1004
+sstable_size=1004
+block_count=10
+block[0]: abs_addr=0x0000000000000000 size=63
+block[1]: abs_addr=0x0000000000000044 size=63
+block[2]: abs_addr=0x0000000000000088 size=63
+block[3]: abs_addr=0x00000000000000cc size=63
+block[4]: abs_addr=0x0000000000000110 size=63
+block[5]: abs_addr=0x0000000000000154 size=63
+block[6]: abs_addr=0x0000000000000198 size=63
+block[7]: abs_addr=0x00000000000001dc size=63
+block[8]: abs_addr=0x0000000000000220 size=63
+block[9]: abs_addr=0x0000000000000264 size=63
+
+# src1  base=0x00004000  total_size=1009
+sstable_size=1009
+block_count=10
+block[0]: abs_addr=0x0000000000004000 size=64
+block[1]: abs_addr=0x0000000000004045 size=63
+block[2]: abs_addr=0x0000000000004089 size=64
+block[3]: abs_addr=0x00000000000040ce size=63
+block[4]: abs_addr=0x0000000000004112 size=64
+block[5]: abs_addr=0x0000000000004157 size=63
+block[6]: abs_addr=0x000000000000419b size=64
+block[7]: abs_addr=0x00000000000041e0 size=63
+block[8]: abs_addr=0x0000000000004224 size=64
+block[9]: abs_addr=0x0000000000004269 size=63
+
+# total src0 records: 20
+# total src1 records: 20

@@ -1,0 +1,15 @@
+localparam integer SRC0_SSTABLE_BYTES = 245;
+localparam integer SRC1_SSTABLE_BYTES = 228;
+localparam integer SRC0_BLOCK_INDEX = 1;
+localparam integer SRC1_BLOCK_INDEX = 0;
+localparam integer SRC0_SELECTED_BLOCK_OFFSET = 49;
+localparam integer SRC0_SELECTED_BLOCK_SIZE = 81;
+localparam integer SRC1_SELECTED_BLOCK_OFFSET = 0;
+localparam integer SRC1_SELECTED_BLOCK_SIZE = 64;
+localparam integer EXPECTED_MID_BYTES = 67;
+localparam integer EXPECTED_DST_BYTES = 67;
+localparam integer EXPECTED_SRC0_DECODED = 4;
+localparam integer EXPECTED_SRC1_DECODED = 3;
+localparam integer EXPECTED_MERGE_DECODED = 7;
+localparam integer EXPECTED_MERGE_KEPT = 4;
+localparam integer EXPECTED_MERGE_DROPPED = 3;

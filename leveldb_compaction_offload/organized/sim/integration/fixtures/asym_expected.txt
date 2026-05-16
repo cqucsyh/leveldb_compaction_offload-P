@@ -1,0 +1,15 @@
+# Asymmetric SSTable fixture summary
+# SRC0: 362 bytes  2 blocks
+# SRC1: 568 bytes  4 blocks
+#
+# Expected counters:
+#   block_pair_count = 4  (max of 2,4)
+#   src0_decoded     = 8  (4+4+0+0)
+#   src1_decoded     = 12 (3+3+3+3)
+#   merge_decoded    = 20
+#   merge_merged     = 20  (all kept, no cross-source dups)
+#   merge_dropped    = 0
+#   stage5_input     = 20
+#   stage5_encoded   = 20
+src0_size=362
+src1_size=568

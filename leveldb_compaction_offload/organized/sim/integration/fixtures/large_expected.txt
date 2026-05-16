@@ -1,0 +1,8 @@
+block_pair_count=16
+total_src0_decoded=64
+total_src1_decoded=32
+total_merge_decoded=96
+total_merge_merged=80
+total_merge_dropped=16
+total_stage5_input=80
+total_stage5_encoded=80

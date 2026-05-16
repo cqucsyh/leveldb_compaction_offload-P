@@ -1,0 +1,237 @@
+`timescale 1ns / 1ps
+
+module stage4_real_data_block_record_emit_top #(
+    parameter integer AXI_ADDR_WIDTH  = 64,
+    parameter integer AXI_DATA_WIDTH  = 512,
+    parameter integer AXI_ID_WIDTH    = 1,
+    parameter integer MAX_BURST_LEN   = 16,
+    parameter integer MAX_BLOCK_BYTES = 4096,
+    parameter integer MAX_KEY_BYTES   = 256
+) (
+    input  wire                          clk,
+    input  wire                          rstn,
+    input  wire                          clear,
+    input  wire                          start,
+    input  wire [AXI_ADDR_WIDTH-1:0]     src_base_addr,
+    input  wire [31:0]                   byte_count,
+    output wire                          busy,
+    output wire                          done,
+    output wire                          error,
+    output wire [31:0]                   bytes_read,
+    output wire [31:0]                   beats_read,
+    output wire                          record_valid,
+    input  wire                          record_ready,
+    output wire [15:0]                   record_key_len,
+    output wire [15:0]                   record_value_len,
+    output wire [15:0]                   record_shared_bytes,
+    output wire [15:0]                   record_non_shared_bytes,
+    // OPT-D3: 32-bit record byte stream
+    output wire [31:0]                   record_tdata,
+    output wire [3:0]                    record_tkeep,
+    output wire                          record_tlast,
+    output wire                          record_tvalid,
+    input  wire                          record_tready,
+    output wire [31:0]                   decoded_entry_count,
+    output wire [31:0]                   restart_count,
+    output wire [31:0]                   restart_entry_count,
+    output wire [31:0]                   shared_key_bytes_total,
+    output wire [31:0]                   unshared_key_bytes_total,
+    output wire [31:0]                   value_bytes_total,
+    output wire [15:0]                   last_key_len,
+    output wire [15:0]                   last_value_len,
+    output wire [15:0]                   last_shared_bytes,
+    output wire [15:0]                   last_non_shared_bytes,
+    output wire [31:0]                   restart_array_offset,
+
+    output wire [AXI_ADDR_WIDTH-1:0]     m_axi_araddr,
+    output wire [7:0]                    m_axi_arlen,
+    output wire [2:0]                    m_axi_arsize,
+    output wire [1:0]                    m_axi_arburst,
+    output wire [AXI_ID_WIDTH-1:0]       m_axi_arid,
+    output wire                          m_axi_arvalid,
+    input  wire                          m_axi_arready,
+    input  wire [AXI_DATA_WIDTH-1:0]     m_axi_rdata,
+    input  wire [1:0]                    m_axi_rresp,
+    input  wire                          m_axi_rlast,
+    input  wire [AXI_ID_WIDTH-1:0]       m_axi_rid,
+    input  wire                          m_axi_rvalid,
+    output wire                          m_axi_rready
+);
+
+    localparam integer AXI_KEEP_WIDTH  = AXI_DATA_WIDTH / 8;
+    localparam integer AXI_BEAT_SHIFT  = $clog2(AXI_KEEP_WIDTH);
+
+    wire [5:0]                align_offset_w;
+    wire [AXI_ADDR_WIDTH-1:0] aligned_base_addr;
+    wire [31:0]               adjusted_byte_count;
+
+    assign align_offset_w     = src_base_addr[AXI_BEAT_SHIFT-1:0];
+    assign aligned_base_addr  = {src_base_addr[AXI_ADDR_WIDTH-1:AXI_BEAT_SHIFT], {AXI_BEAT_SHIFT{1'b0}}};
+    assign adjusted_byte_count = byte_count + {26'b0, align_offset_w};
+
+    wire [AXI_DATA_WIDTH-1:0] beat_tdata;
+    wire [AXI_KEEP_WIDTH-1:0] beat_tkeep;
+    wire                      beat_tlast;
+    wire                      beat_tvalid;
+    wire                      beat_tready;
+
+    wire [7:0]                byte_tdata;
+    wire [0:0]                byte_tkeep;
+    wire                      byte_tlast;
+    wire                      byte_tvalid;
+    wire                      byte_tready;
+
+    wire [7:0]                aligned_byte_tdata;
+    wire [0:0]                aligned_byte_tkeep;
+    wire                      aligned_byte_tlast;
+    wire                      aligned_byte_tvalid;
+    wire                      aligned_byte_tready;
+
+    wire rd_busy;
+    wire rd_error;
+    wire dec_busy;
+    wire dec_done;
+    wire dec_error;
+
+    // Zero-byte bypass: byte_count==0 means "empty block" (asymmetric pair).
+    // The axi_read_engine completes immediately but sends no beats, so the
+    // block decoder would stall forever in ST_CAPTURE.  Instead, register a
+    // one-cycle done pulse and keep the decoder un-started.
+    reg  zero_done_r;
+    wire is_zero_w = (byte_count == 32'd0);
+
+    always @(posedge clk) begin
+        if (!rstn || clear)
+            zero_done_r <= 1'b0;
+        else
+            zero_done_r <= start && is_zero_w;
+    end
+
+    wire dec_start_w = start && !is_zero_w;
+
+    axi_read_engine #(
+        .AXI_ADDR_WIDTH(AXI_ADDR_WIDTH),
+        .AXI_DATA_WIDTH(AXI_DATA_WIDTH),
+        .AXI_ID_WIDTH(AXI_ID_WIDTH),
+        .MAX_BURST_LEN(MAX_BURST_LEN)
+    ) u_axi_read_engine (
+        .clk(clk),
+        .rstn(rstn),
+        .clear(clear),
+        .start(start),
+        .base_addr(aligned_base_addr),
+        .byte_count(adjusted_byte_count),
+        .busy(rd_busy),
+        .done(),
+        .error(rd_error),
+        .bytes_read(bytes_read),
+        .beats_read(beats_read),
+        .m_axi_araddr(m_axi_araddr),
+        .m_axi_arlen(m_axi_arlen),
+        .m_axi_arsize(m_axi_arsize),
+        .m_axi_arburst(m_axi_arburst),
+        .m_axi_arid(m_axi_arid),
+        .m_axi_arvalid(m_axi_arvalid),
+        .m_axi_arready(m_axi_arready),
+        .m_axi_rdata(m_axi_rdata),
+        .m_axi_rresp(m_axi_rresp),
+        .m_axi_rlast(m_axi_rlast),
+        .m_axi_rid(m_axi_rid),
+        .m_axi_rvalid(m_axi_rvalid),
+        .m_axi_rready(m_axi_rready),
+        .m_axis_tdata(beat_tdata),
+        .m_axis_tkeep(beat_tkeep),
+        .m_axis_tlast(beat_tlast),
+        .m_axis_tvalid(beat_tvalid),
+        .m_axis_tready(beat_tready)
+    );
+
+    stream_width_adapter #(
+        .IN_DATA_WIDTH(AXI_DATA_WIDTH),
+        .IN_KEEP_WIDTH(AXI_KEEP_WIDTH),
+        .OUT_DATA_WIDTH(8),
+        .OUT_KEEP_WIDTH(1)
+    ) u_stream_width_adapter (
+        .clk(clk),
+        .rstn(rstn),
+        .clear(clear),
+        .s_axis_tdata(beat_tdata),
+        .s_axis_tkeep(beat_tkeep),
+        .s_axis_tlast(beat_tlast),
+        .s_axis_tvalid(beat_tvalid),
+        .s_axis_tready(beat_tready),
+        .m_axis_tdata(byte_tdata),
+        .m_axis_tkeep(byte_tkeep),
+        .m_axis_tlast(byte_tlast),
+        .m_axis_tvalid(byte_tvalid),
+        .m_axis_tready(byte_tready)
+    );
+
+    byte_skip_adapter #(
+        .SKIP_WIDTH(AXI_BEAT_SHIFT)
+    ) u_byte_skip_adapter (
+        .clk(clk),
+        .rstn(rstn),
+        .clear(clear),
+        .start(start),
+        .skip_bytes(align_offset_w),
+        .s_axis_tdata(byte_tdata),
+        .s_axis_tkeep(byte_tkeep),
+        .s_axis_tlast(byte_tlast),
+        .s_axis_tvalid(byte_tvalid),
+        .s_axis_tready(byte_tready),
+        .m_axis_tdata(aligned_byte_tdata),
+        .m_axis_tkeep(aligned_byte_tkeep),
+        .m_axis_tlast(aligned_byte_tlast),
+        .m_axis_tvalid(aligned_byte_tvalid),
+        .m_axis_tready(aligned_byte_tready)
+    );
+
+    real_data_block_record_decoder #(
+        .MAX_BLOCK_BYTES(MAX_BLOCK_BYTES),
+        .MAX_KEY_BYTES(MAX_KEY_BYTES)
+    ) u_real_data_block_record_decoder (
+        .clk(clk),
+        .rstn(rstn),
+        .clear(clear),
+        .start(dec_start_w),
+        .block_byte_count(byte_count),   // OPT-3A: pass block size for streaming parse
+        .s_axis_tdata(aligned_byte_tdata),
+        .s_axis_tkeep(aligned_byte_tkeep),
+        .s_axis_tlast(aligned_byte_tlast),
+        .s_axis_tvalid(aligned_byte_tvalid),
+        .s_axis_tready(aligned_byte_tready),
+        .busy(dec_busy),
+        .done(dec_done),
+        .error(dec_error),
+        .record_valid(record_valid),
+        .record_ready(record_ready),
+        .record_key_len(record_key_len),
+        .record_value_len(record_value_len),
+        .record_shared_bytes(record_shared_bytes),
+        .record_non_shared_bytes(record_non_shared_bytes),
+        .m_axis_tdata(record_tdata),
+        .m_axis_tkeep(record_tkeep),
+        .m_axis_tlast(record_tlast),
+        .m_axis_tvalid(record_tvalid),
+        .m_axis_tready(record_tready),
+        .decoded_entry_count(decoded_entry_count),
+        .restart_count(restart_count),
+        .restart_entry_count(restart_entry_count),
+        .shared_key_bytes_total(shared_key_bytes_total),
+        .unshared_key_bytes_total(unshared_key_bytes_total),
+        .value_bytes_total(value_bytes_total),
+        .last_key_len(last_key_len),
+        .last_value_len(last_value_len),
+        .last_shared_bytes(last_shared_bytes),
+        .last_non_shared_bytes(last_non_shared_bytes),
+        .restart_array_offset(restart_array_offset)
+    );
+
+    // When zero-byte bypass active: done fires for one cycle, busy/error=0;
+    // decoder outputs (record_valid, counters) naturally stay zero.
+    assign busy  = zero_done_r ? 1'b0 : (rd_busy | dec_busy);
+    assign done  = zero_done_r ? 1'b1 : dec_done;
+    assign error = rd_error | dec_error;
+
+endmodule

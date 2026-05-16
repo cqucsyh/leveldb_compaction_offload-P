@@ -1,0 +1,10 @@
+scenario=long_value
+src0_size=5009
+src1_size=5009
+src0_blocks=4
+src1_blocks=4
+src0_records=12
+src1_records=12
+block_pairs=4
+expected_merged=24
+expected_dropped=0

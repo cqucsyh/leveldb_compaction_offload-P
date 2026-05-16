@@ -1,0 +1,21 @@
+# Multi-SSTable P1+P2 fixture summary
+#
+# SRC0: 2 SSTables, 2 blocks each = 4 total blocks
+# SRC1: 2 SSTables, 2 blocks each = 4 total blocks
+# Pairs: 4  (max of 4,4)
+# All keys unique across sources: merge_dropped=0
+#
+# P1 (no split) expectations:
+#   block_pair_count = 4
+#   merge_merged     = 32  (4 pairs × 8 records)
+#   merge_dropped    = 0
+#   dst_seg_count    = 1
+#
+# P2 (max_seg_data_bytes=1, split after every block) expectations:
+#   dst_seg_count    = 4
+#   dst_seg_total_bytes[0..3] all > 0
+#
+src0_sst0_size=362
+src0_sst1_size=362
+src1_sst0_size=362
+src1_sst1_size=362

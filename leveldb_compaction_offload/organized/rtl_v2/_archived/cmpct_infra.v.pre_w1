@@ -1,0 +1,888 @@
+`timescale 1ns / 1ps
+
+module stream_fifo #(
+    parameter integer DATA_WIDTH = 577,
+    parameter integer DEPTH = 32
+) (
+    input  wire                   clk,
+    input  wire                   rstn,
+    input  wire                   clear,
+    input  wire [DATA_WIDTH-1:0]  s_data,
+    input  wire                   s_valid,
+    output wire                   s_ready,
+    output wire [DATA_WIDTH-1:0]  m_data,
+    output wire                   m_valid,
+    input  wire                   m_ready,
+    output wire [$clog2(DEPTH+1)-1:0] occupancy
+);
+
+    localparam integer PTR_W = (DEPTH <= 2) ? 1 : $clog2(DEPTH);
+    localparam integer CNT_W = $clog2(DEPTH+1);
+
+    reg [DATA_WIDTH-1:0] mem [0:DEPTH-1];
+    reg [PTR_W-1:0] wr_ptr;
+    reg [PTR_W-1:0] rd_ptr;
+    reg [CNT_W-1:0] count;
+
+    wire do_push;
+    wire do_pop;
+
+    assign s_ready = (count < DEPTH) || ((count != 0) && m_ready);
+    assign m_valid = (count != 0);
+    assign m_data = mem[rd_ptr];
+    assign occupancy = count;
+
+    assign do_push = s_valid && s_ready;
+    assign do_pop  = m_valid && m_ready;
+
+    always @(posedge clk) begin
+        if (!rstn) begin
+            wr_ptr <= {PTR_W{1'b0}};
+            rd_ptr <= {PTR_W{1'b0}};
+            count  <= {CNT_W{1'b0}};
+        end else if (clear) begin
+            wr_ptr <= {PTR_W{1'b0}};
+            rd_ptr <= {PTR_W{1'b0}};
+            count  <= {CNT_W{1'b0}};
+        end else begin
+            if (do_push) begin
+                mem[wr_ptr] <= s_data;
+                if (wr_ptr == DEPTH-1) begin
+                    wr_ptr <= {PTR_W{1'b0}};
+                end else begin
+                    wr_ptr <= wr_ptr + {{(PTR_W-1){1'b0}}, 1'b1};
+                end
+            end
+
+            if (do_pop) begin
+                if (rd_ptr == DEPTH-1) begin
+                    rd_ptr <= {PTR_W{1'b0}};
+                end else begin
+                    rd_ptr <= rd_ptr + {{(PTR_W-1){1'b0}}, 1'b1};
+                end
+            end
+
+            case ({do_push, do_pop})
+                2'b10: count <= count + {{(CNT_W-1){1'b0}}, 1'b1};
+                2'b01: count <= count - {{(CNT_W-1){1'b0}}, 1'b1};
+                default: count <= count;
+            endcase
+        end
+    end
+
+endmodule
+`timescale 1ns / 1ps
+
+module stream_width_adapter #(
+    parameter integer IN_DATA_WIDTH = 512,
+    parameter integer IN_KEEP_WIDTH = IN_DATA_WIDTH / 8,
+    parameter integer OUT_DATA_WIDTH = 8,
+    parameter integer OUT_KEEP_WIDTH = (OUT_DATA_WIDTH + 7) / 8
+) (
+    input  wire                        clk,
+    input  wire                        rstn,
+    input  wire                        clear,
+    input  wire [IN_DATA_WIDTH-1:0]    s_axis_tdata,
+    input  wire [IN_KEEP_WIDTH-1:0]    s_axis_tkeep,
+    input  wire                        s_axis_tlast,
+    input  wire                        s_axis_tvalid,
+    output wire                        s_axis_tready,
+    output wire [OUT_DATA_WIDTH-1:0]   m_axis_tdata,
+    output wire [OUT_KEEP_WIDTH-1:0]   m_axis_tkeep,
+    output wire                        m_axis_tlast,
+    output wire                        m_axis_tvalid,
+    input  wire                        m_axis_tready
+);
+
+    localparam integer OUT_BYTES = OUT_DATA_WIDTH / 8;
+    localparam integer IN_BYTES  = IN_DATA_WIDTH / 8;
+    localparam integer IDX_W     = (IN_BYTES <= 2) ? 1 : $clog2(IN_BYTES + 1);
+
+    reg [IN_DATA_WIDTH-1:0] hold_data;
+    reg [IN_KEEP_WIDTH-1:0] hold_keep;
+    reg                     hold_last;
+    reg                     hold_valid;
+    reg [IDX_W-1:0]         hold_index;
+    reg [IDX_W-1:0]         hold_count;
+
+    wire [OUT_DATA_WIDTH-1:0] cur_data;
+    wire [OUT_KEEP_WIDTH-1:0] cur_keep;
+    wire                      cur_beat_last;
+    wire                      cur_last;
+    wire                      advance;
+
+    integer i;
+    reg [IDX_W-1:0] valid_count_comb;
+
+    always @(*) begin
+        valid_count_comb = {IDX_W{1'b0}};
+        for (i = 0; i < IN_BYTES; i = i + 1) begin
+            if (s_axis_tkeep[i]) begin
+                valid_count_comb = valid_count_comb + {{(IDX_W-1){1'b0}}, 1'b1};
+            end
+        end
+    end
+
+    assign cur_data = hold_data[hold_index*OUT_DATA_WIDTH +: OUT_DATA_WIDTH];
+    assign cur_keep = hold_keep[hold_index*OUT_KEEP_WIDTH +: OUT_KEEP_WIDTH];
+    assign cur_beat_last = (hold_index + OUT_BYTES >= hold_count);
+    assign cur_last = hold_last && cur_beat_last;
+
+    assign m_axis_tdata  = cur_data;
+    assign m_axis_tkeep  = cur_keep;
+    assign m_axis_tlast  = cur_last;
+    assign m_axis_tvalid = hold_valid;
+
+    assign s_axis_tready = !hold_valid;
+    assign advance = hold_valid && m_axis_tready;
+
+    always @(posedge clk) begin
+        if (!rstn) begin
+            hold_data  <= {IN_DATA_WIDTH{1'b0}};
+            hold_keep  <= {IN_KEEP_WIDTH{1'b0}};
+            hold_last  <= 1'b0;
+            hold_valid <= 1'b0;
+            hold_index <= {IDX_W{1'b0}};
+            hold_count <= {IDX_W{1'b0}};
+        end else if (clear) begin
+            hold_data  <= {IN_DATA_WIDTH{1'b0}};
+            hold_keep  <= {IN_KEEP_WIDTH{1'b0}};
+            hold_last  <= 1'b0;
+            hold_valid <= 1'b0;
+            hold_index <= {IDX_W{1'b0}};
+            hold_count <= {IDX_W{1'b0}};
+        end else begin
+            if (s_axis_tvalid && s_axis_tready) begin
+                hold_data  <= s_axis_tdata;
+                hold_keep  <= s_axis_tkeep;
+                hold_last  <= s_axis_tlast;
+                hold_valid <= 1'b1;
+                hold_index <= {IDX_W{1'b0}};
+                hold_count <= valid_count_comb;
+            end else if (advance) begin
+                if (cur_beat_last) begin
+                    hold_valid <= 1'b0;
+                    hold_index <= {IDX_W{1'b0}};
+                end else begin
+                    hold_index <= hold_index + OUT_BYTES[IDX_W-1:0];
+                end
+            end
+        end
+    end
+
+endmodule
+`timescale 1ns / 1ps
+
+module stream_pack_adapter #(
+    parameter integer IN_DATA_WIDTH  = 8,
+    parameter integer IN_KEEP_WIDTH  = 1,
+    parameter integer OUT_DATA_WIDTH = 512,
+    parameter integer OUT_KEEP_WIDTH = OUT_DATA_WIDTH / 8
+) (
+    input  wire                       clk,
+    input  wire                       rstn,
+    input  wire                       clear,
+    input  wire [IN_DATA_WIDTH-1:0]   s_axis_tdata,
+    input  wire [IN_KEEP_WIDTH-1:0]   s_axis_tkeep,
+    input  wire                       s_axis_tlast,
+    input  wire                       s_axis_tvalid,
+    output wire                       s_axis_tready,
+    output wire [OUT_DATA_WIDTH-1:0]  m_axis_tdata,
+    output wire [OUT_KEEP_WIDTH-1:0]  m_axis_tkeep,
+    output wire                       m_axis_tlast,
+    output wire                       m_axis_tvalid,
+    input  wire                       m_axis_tready
+);
+
+    localparam integer IN_BYTES  = IN_DATA_WIDTH / 8;
+    localparam integer OUT_BYTES = OUT_DATA_WIDTH / 8;
+    localparam integer COUNT_W   = (OUT_BYTES <= 2) ? 1 : $clog2(OUT_BYTES + 1);
+
+    reg [OUT_DATA_WIDTH-1:0] pack_data;
+    reg [OUT_KEEP_WIDTH-1:0] pack_keep;
+    reg [COUNT_W-1:0]        pack_count;
+    reg                      pack_last_pending;
+    reg                      out_valid;
+    reg                      out_last;
+
+    wire input_accept;
+    wire output_accept;
+    wire [COUNT_W-1:0] next_count;
+    wire input_fills_packet;
+
+    assign s_axis_tready = !out_valid;
+    assign input_accept = s_axis_tvalid && s_axis_tready && s_axis_tkeep[0];
+    assign output_accept = out_valid && m_axis_tready;
+    assign next_count = pack_count + IN_BYTES[COUNT_W-1:0];
+    assign input_fills_packet = (next_count == OUT_BYTES[COUNT_W-1:0]) || s_axis_tlast;
+
+    assign m_axis_tdata  = pack_data;
+    assign m_axis_tkeep  = pack_keep;
+    assign m_axis_tlast  = out_last;
+    assign m_axis_tvalid = out_valid;
+
+    always @(posedge clk) begin
+        if (!rstn) begin
+            pack_data         <= {OUT_DATA_WIDTH{1'b0}};
+            pack_keep         <= {OUT_KEEP_WIDTH{1'b0}};
+            pack_count        <= {COUNT_W{1'b0}};
+            pack_last_pending <= 1'b0;
+            out_valid         <= 1'b0;
+            out_last          <= 1'b0;
+        end else if (clear) begin
+            pack_data         <= {OUT_DATA_WIDTH{1'b0}};
+            pack_keep         <= {OUT_KEEP_WIDTH{1'b0}};
+            pack_count        <= {COUNT_W{1'b0}};
+            pack_last_pending <= 1'b0;
+            out_valid         <= 1'b0;
+            out_last          <= 1'b0;
+        end else begin
+            if (output_accept) begin
+                out_valid <= 1'b0;
+                out_last  <= 1'b0;
+                pack_data <= {OUT_DATA_WIDTH{1'b0}};
+                pack_keep <= {OUT_KEEP_WIDTH{1'b0}};
+                pack_count <= {COUNT_W{1'b0}};
+                pack_last_pending <= 1'b0;
+            end
+
+            if (input_accept) begin
+                pack_data[pack_count*IN_DATA_WIDTH +: IN_DATA_WIDTH] <= s_axis_tdata;
+                pack_keep[pack_count +: IN_BYTES] <= s_axis_tkeep;
+                pack_last_pending <= s_axis_tlast;
+                if (input_fills_packet) begin
+                    out_valid <= 1'b1;
+                    out_last  <= s_axis_tlast;
+                end
+                pack_count <= input_fills_packet ? {COUNT_W{1'b0}} : next_count;
+            end
+        end
+    end
+
+endmodule
+`timescale 1ns / 1ps
+
+module axi_read_engine #(
+    parameter integer AXI_ADDR_WIDTH = 64,
+    parameter integer AXI_DATA_WIDTH = 512,
+    parameter integer AXI_ID_WIDTH   = 1,
+    parameter integer MAX_BURST_LEN  = 16
+) (
+    input  wire                              clk,
+    input  wire                              rstn,
+    input  wire                              clear,
+    input  wire                              start,
+    input  wire [AXI_ADDR_WIDTH-1:0]         base_addr,
+    input  wire [31:0]                       byte_count,
+    output reg                               busy,
+    output reg                               done,
+    output reg                               error,
+    output reg  [31:0]                       bytes_read,
+    output reg  [31:0]                       beats_read,
+
+    output reg  [AXI_ADDR_WIDTH-1:0]         m_axi_araddr,
+    output reg  [7:0]                        m_axi_arlen,
+    output reg  [2:0]                        m_axi_arsize,
+    output reg  [1:0]                        m_axi_arburst,
+    output reg  [AXI_ID_WIDTH-1:0]           m_axi_arid,
+    output reg                               m_axi_arvalid,
+    input  wire                              m_axi_arready,
+    input  wire [AXI_DATA_WIDTH-1:0]         m_axi_rdata,
+    input  wire [1:0]                        m_axi_rresp,
+    input  wire                              m_axi_rlast,
+    input  wire [AXI_ID_WIDTH-1:0]           m_axi_rid,
+    input  wire                              m_axi_rvalid,
+    output wire                              m_axi_rready,
+
+    output wire [AXI_DATA_WIDTH-1:0]         m_axis_tdata,
+    output wire [(AXI_DATA_WIDTH/8)-1:0]     m_axis_tkeep,
+    output wire                              m_axis_tlast,
+    output wire                              m_axis_tvalid,
+    input  wire                              m_axis_tready
+);
+
+    localparam integer AXI_KEEP_WIDTH = AXI_DATA_WIDTH / 8;
+    localparam integer AXI_BEAT_BYTES = AXI_DATA_WIDTH / 8;
+    localparam integer AXI_BEAT_SHIFT = $clog2(AXI_BEAT_BYTES);
+    localparam [2:0]   AXI_BURST_SIZE = AXI_BEAT_SHIFT[2:0];
+
+    reg [31:0]                beats_remaining;
+    reg [31:0]                beats_in_burst_remaining;
+    reg [AXI_ADDR_WIDTH-1:0]  next_addr;
+    reg                       waiting_for_r;
+
+    reg [AXI_DATA_WIDTH-1:0]  out_data;
+    reg [AXI_KEEP_WIDTH-1:0]  out_keep;
+    reg                       out_last;
+    reg                       out_valid;
+
+    wire                      out_accept;
+    wire                      can_take_r;
+    wire [31:0]               total_beats_start;
+    wire [7:0]                next_burst_len;
+    wire                      current_is_last;
+    wire [AXI_KEEP_WIDTH-1:0] final_keep_mask;
+
+    integer i;
+    reg [AXI_KEEP_WIDTH-1:0] final_keep_mask_r;
+    reg [31:0] bytes_this_beat;
+
+    assign total_beats_start = (byte_count + AXI_BEAT_BYTES - 1) >> AXI_BEAT_SHIFT;
+    assign next_burst_len = (beats_remaining > MAX_BURST_LEN) ? MAX_BURST_LEN[7:0] : beats_remaining[7:0];
+    assign current_is_last = (beats_remaining == 32'd1);
+
+    always @(*) begin
+        final_keep_mask_r = {AXI_KEEP_WIDTH{1'b0}};
+        if (byte_count[AXI_BEAT_SHIFT-1:0] == {AXI_BEAT_SHIFT{1'b0}}) begin
+            final_keep_mask_r = {AXI_KEEP_WIDTH{1'b1}};
+        end else begin
+            for (i = 0; i < AXI_KEEP_WIDTH; i = i + 1) begin
+                if (i < byte_count[AXI_BEAT_SHIFT-1:0]) begin
+                    final_keep_mask_r[i] = 1'b1;
+                end
+            end
+        end
+    end
+
+    assign final_keep_mask = final_keep_mask_r;
+    assign m_axis_tdata  = out_data;
+    assign m_axis_tkeep  = out_keep;
+    assign m_axis_tlast  = out_last;
+    assign m_axis_tvalid = out_valid;
+
+    assign out_accept = out_valid && m_axis_tready;
+    assign can_take_r = (!out_valid) || m_axis_tready;
+    assign m_axi_rready = can_take_r;
+
+    always @(posedge clk) begin
+        if (!rstn) begin
+            busy                       <= 1'b0;
+            done                       <= 1'b0;
+            error                      <= 1'b0;
+            bytes_read                 <= 32'd0;
+            beats_read                 <= 32'd0;
+            beats_remaining            <= 32'd0;
+            beats_in_burst_remaining   <= 32'd0;
+            next_addr                  <= {AXI_ADDR_WIDTH{1'b0}};
+            waiting_for_r              <= 1'b0;
+            m_axi_araddr               <= {AXI_ADDR_WIDTH{1'b0}};
+            m_axi_arlen                <= 8'd0;
+            m_axi_arsize               <= AXI_BURST_SIZE;
+            m_axi_arburst              <= 2'b01;
+            m_axi_arid                 <= {AXI_ID_WIDTH{1'b0}};
+            m_axi_arvalid              <= 1'b0;
+            out_data                   <= {AXI_DATA_WIDTH{1'b0}};
+            out_keep                   <= {AXI_KEEP_WIDTH{1'b0}};
+            out_last                   <= 1'b0;
+            out_valid                  <= 1'b0;
+        end else if (clear) begin
+            busy                       <= 1'b0;
+            done                       <= 1'b0;
+            error                      <= 1'b0;
+            bytes_read                 <= 32'd0;
+            beats_read                 <= 32'd0;
+            beats_remaining            <= 32'd0;
+            beats_in_burst_remaining   <= 32'd0;
+            next_addr                  <= {AXI_ADDR_WIDTH{1'b0}};
+            waiting_for_r              <= 1'b0;
+            m_axi_araddr               <= {AXI_ADDR_WIDTH{1'b0}};
+            m_axi_arlen                <= 8'd0;
+            m_axi_arsize               <= AXI_BURST_SIZE;
+            m_axi_arburst              <= 2'b01;
+            m_axi_arid                 <= {AXI_ID_WIDTH{1'b0}};
+            m_axi_arvalid              <= 1'b0;
+            out_data                   <= {AXI_DATA_WIDTH{1'b0}};
+            out_keep                   <= {AXI_KEEP_WIDTH{1'b0}};
+            out_last                   <= 1'b0;
+            out_valid                  <= 1'b0;
+        end else begin
+            done <= 1'b0;
+
+            if (out_accept && !m_axi_rvalid) begin
+                out_valid <= 1'b0;
+            end
+
+            if (start && !busy) begin
+                busy                     <= (byte_count != 32'd0);
+                error                    <= 1'b0;
+                done                     <= (byte_count == 32'd0);
+                bytes_read               <= 32'd0;
+                beats_read               <= 32'd0;
+                beats_remaining          <= total_beats_start;
+                beats_in_burst_remaining <= 32'd0;
+                next_addr                <= base_addr;
+                waiting_for_r            <= 1'b0;
+                m_axi_arvalid            <= 1'b0;
+                out_valid                <= 1'b0;
+            end else if (busy) begin
+                if (!m_axi_arvalid && !waiting_for_r && (beats_remaining != 32'd0)) begin
+                    m_axi_araddr  <= next_addr;
+                    m_axi_arlen   <= next_burst_len - 8'd1;
+                    m_axi_arsize  <= AXI_BURST_SIZE;
+                    m_axi_arburst <= 2'b01;
+                    m_axi_arid    <= {AXI_ID_WIDTH{1'b0}};
+                    m_axi_arvalid <= 1'b1;
+                end
+
+                if (m_axi_arvalid && m_axi_arready) begin
+                    m_axi_arvalid            <= 1'b0;
+                    waiting_for_r            <= 1'b1;
+                    beats_in_burst_remaining <= next_burst_len;
+                    next_addr                <= next_addr + ({ {(AXI_ADDR_WIDTH-8){1'b0}}, next_burst_len } << AXI_BEAT_SHIFT);
+                end
+
+                if (m_axi_rvalid && can_take_r) begin
+                    out_data  <= m_axi_rdata;
+                    out_keep  <= current_is_last ? final_keep_mask : {AXI_KEEP_WIDTH{1'b1}};
+                    out_last  <= current_is_last;
+                    out_valid <= 1'b1;
+
+                    if (m_axi_rresp != 2'b00) begin
+                        error <= 1'b1;
+                    end
+
+                    bytes_this_beat = current_is_last ? ((byte_count[AXI_BEAT_SHIFT-1:0] == {AXI_BEAT_SHIFT{1'b0}}) ? AXI_BEAT_BYTES : byte_count[AXI_BEAT_SHIFT-1:0]) : AXI_BEAT_BYTES;
+                    bytes_read <= bytes_read + bytes_this_beat;
+                    beats_read <= beats_read + 32'd1;
+
+                    if (beats_remaining != 32'd0) begin
+                        beats_remaining <= beats_remaining - 32'd1;
+                    end
+
+                    if (beats_in_burst_remaining != 32'd0) begin
+                        beats_in_burst_remaining <= beats_in_burst_remaining - 32'd1;
+                        if (beats_in_burst_remaining == 32'd1) begin
+                            waiting_for_r <= 1'b0;
+                        end
+                    end
+
+                    if ((m_axi_rlast != 1'b1) && (beats_in_burst_remaining == 32'd1)) begin
+                        error <= 1'b1;
+                    end
+                    if ((m_axi_rlast == 1'b1) && (beats_in_burst_remaining != 32'd1)) begin
+                        error <= 1'b1;
+                    end
+
+                    if (current_is_last) begin
+                        busy <= 1'b0;
+                        done <= 1'b1;
+                        waiting_for_r <= 1'b0;
+                    end
+                end
+            end
+        end
+    end
+
+endmodule
+`timescale 1ns / 1ps
+
+module axi_write_engine #(
+    parameter integer AXI_ADDR_WIDTH = 64,
+    parameter integer AXI_DATA_WIDTH = 512,
+    parameter integer AXI_ID_WIDTH   = 1,
+    parameter integer MAX_BURST_LEN  = 16,
+    parameter integer TLAST_STOP     = 0
+) (
+    input  wire                              clk,
+    input  wire                              rstn,
+    input  wire                              clear,
+    input  wire                              start,
+    input  wire [AXI_ADDR_WIDTH-1:0]         base_addr,
+    input  wire [31:0]                       byte_count,
+    output reg                               busy,
+    output reg                               done,
+    output reg                               error,
+    output reg  [31:0]                       bytes_written,
+    output reg  [31:0]                       beats_written,
+
+    input  wire [AXI_DATA_WIDTH-1:0]         s_axis_tdata,
+    input  wire [(AXI_DATA_WIDTH/8)-1:0]     s_axis_tkeep,
+    input  wire                              s_axis_tlast,
+    input  wire                              s_axis_tvalid,
+    output wire                              s_axis_tready,
+
+    output reg  [AXI_ADDR_WIDTH-1:0]         m_axi_awaddr,
+    output reg  [7:0]                        m_axi_awlen,
+    output reg  [2:0]                        m_axi_awsize,
+    output reg  [1:0]                        m_axi_awburst,
+    output reg  [AXI_ID_WIDTH-1:0]           m_axi_awid,
+    output reg                               m_axi_awvalid,
+    input  wire                              m_axi_awready,
+    output reg  [AXI_DATA_WIDTH-1:0]         m_axi_wdata,
+    output reg  [(AXI_DATA_WIDTH/8)-1:0]     m_axi_wstrb,
+    output reg                               m_axi_wlast,
+    output reg                               m_axi_wvalid,
+    input  wire                              m_axi_wready,
+    input  wire [1:0]                        m_axi_bresp,
+    input  wire [AXI_ID_WIDTH-1:0]           m_axi_bid,
+    input  wire                              m_axi_bvalid,
+    output reg                               m_axi_bready
+);
+
+    localparam integer AXI_KEEP_WIDTH = AXI_DATA_WIDTH / 8;
+    localparam integer AXI_BEAT_BYTES = AXI_DATA_WIDTH / 8;
+    localparam integer AXI_BEAT_SHIFT = $clog2(AXI_BEAT_BYTES);
+    localparam [2:0]   AXI_BURST_SIZE = AXI_BEAT_SHIFT[2:0];
+
+    localparam [1:0] ST_IDLE = 2'd0;
+    localparam [1:0] ST_AW   = 2'd1;
+    localparam [1:0] ST_W    = 2'd2;
+    localparam [1:0] ST_B    = 2'd3;
+
+    reg [1:0]                state;
+    reg [31:0]               beats_remaining;
+    reg [31:0]               burst_beats;
+    reg [31:0]               burst_index;
+    reg [AXI_ADDR_WIDTH-1:0] cur_addr;
+    reg                      stream_last_seen;
+
+    wire [7:0] next_burst_len;
+    wire       take_input;
+    wire       w_handshake;
+    wire [31:0] bytes_this_beat;
+
+    assign next_burst_len = (beats_remaining > MAX_BURST_LEN) ? MAX_BURST_LEN[7:0] : beats_remaining[7:0];
+    assign s_axis_tready = busy && (state == ST_W) && !m_axi_wvalid
+                          && !(TLAST_STOP != 0 && stream_last_seen);
+    assign take_input = s_axis_tvalid && s_axis_tready;
+    assign w_handshake = m_axi_wvalid && m_axi_wready;
+    assign bytes_this_beat = keep_popcount(m_axi_wstrb);
+
+    function automatic [31:0] keep_popcount;
+        input [AXI_KEEP_WIDTH-1:0] keep;
+        integer i;
+        begin
+            keep_popcount = 32'd0;
+            for (i = 0; i < AXI_KEEP_WIDTH; i = i + 1) begin
+                if (keep[i]) begin
+                    keep_popcount = keep_popcount + 32'd1;
+                end
+            end
+        end
+    endfunction
+
+    always @(posedge clk) begin
+        if (!rstn) begin
+            busy            <= 1'b0;
+            done            <= 1'b0;
+            error           <= 1'b0;
+            bytes_written   <= 32'd0;
+            beats_written   <= 32'd0;
+            state           <= ST_IDLE;
+            beats_remaining <= 32'd0;
+            burst_beats     <= 32'd0;
+            burst_index     <= 32'd0;
+            cur_addr        <= {AXI_ADDR_WIDTH{1'b0}};
+            stream_last_seen <= 1'b0;
+            m_axi_awaddr    <= {AXI_ADDR_WIDTH{1'b0}};
+            m_axi_awlen     <= 8'd0;
+            m_axi_awsize    <= AXI_BURST_SIZE;
+            m_axi_awburst   <= 2'b01;
+            m_axi_awid      <= {AXI_ID_WIDTH{1'b0}};
+            m_axi_awvalid   <= 1'b0;
+            m_axi_wdata     <= {AXI_DATA_WIDTH{1'b0}};
+            m_axi_wstrb     <= {AXI_KEEP_WIDTH{1'b0}};
+            m_axi_wlast     <= 1'b0;
+            m_axi_wvalid    <= 1'b0;
+            m_axi_bready    <= 1'b0;
+        end else if (clear) begin
+            busy            <= 1'b0;
+            done            <= 1'b0;
+            error           <= 1'b0;
+            bytes_written   <= 32'd0;
+            beats_written   <= 32'd0;
+            state           <= ST_IDLE;
+            beats_remaining <= 32'd0;
+            burst_beats     <= 32'd0;
+            burst_index     <= 32'd0;
+            cur_addr        <= {AXI_ADDR_WIDTH{1'b0}};
+            stream_last_seen <= 1'b0;
+            m_axi_awaddr    <= {AXI_ADDR_WIDTH{1'b0}};
+            m_axi_awlen     <= 8'd0;
+            m_axi_awsize    <= AXI_BURST_SIZE;
+            m_axi_awburst   <= 2'b01;
+            m_axi_awid      <= {AXI_ID_WIDTH{1'b0}};
+            m_axi_awvalid   <= 1'b0;
+            m_axi_wdata     <= {AXI_DATA_WIDTH{1'b0}};
+            m_axi_wstrb     <= {AXI_KEEP_WIDTH{1'b0}};
+            m_axi_wlast     <= 1'b0;
+            m_axi_wvalid    <= 1'b0;
+            m_axi_bready    <= 1'b0;
+        end else begin
+            done <= 1'b0;
+
+            if (start && !busy) begin
+                busy            <= (byte_count != 32'd0);
+                done            <= (byte_count == 32'd0);
+                error           <= 1'b0;
+                bytes_written   <= 32'd0;
+                beats_written   <= 32'd0;
+                beats_remaining <= (byte_count + AXI_BEAT_BYTES - 1) >> AXI_BEAT_SHIFT;
+                burst_beats     <= 32'd0;
+                burst_index     <= 32'd0;
+                cur_addr        <= base_addr;
+                stream_last_seen <= 1'b0;
+                m_axi_awvalid   <= 1'b0;
+                m_axi_wvalid    <= 1'b0;
+                m_axi_bready    <= 1'b0;
+                state           <= (byte_count == 32'd0) ? ST_IDLE : ST_AW;
+            end else if (busy) begin
+                case (state)
+                    ST_AW: begin
+                        if (!m_axi_awvalid) begin
+                            burst_beats   <= next_burst_len;
+                            burst_index   <= 32'd0;
+                            m_axi_awaddr  <= cur_addr;
+                            m_axi_awlen   <= next_burst_len - 8'd1;
+                            m_axi_awsize  <= AXI_BURST_SIZE;
+                            m_axi_awburst <= 2'b01;
+                            m_axi_awid    <= {AXI_ID_WIDTH{1'b0}};
+                            m_axi_awvalid <= 1'b1;
+                        end
+
+                        if (m_axi_awvalid && m_axi_awready) begin
+                            m_axi_awvalid <= 1'b0;
+                            state         <= ST_W;
+                        end
+                    end
+
+                    ST_W: begin
+                        if (take_input) begin
+                            m_axi_wdata  <= s_axis_tdata;
+                            m_axi_wstrb  <= s_axis_tkeep;
+                            m_axi_wlast  <= (burst_index + 32'd1 == burst_beats);
+                            m_axi_wvalid <= 1'b1;
+                            if (TLAST_STOP != 0 && s_axis_tlast)
+                                stream_last_seen <= 1'b1;
+                        end else if (TLAST_STOP != 0 && stream_last_seen && !m_axi_wvalid) begin
+                            m_axi_wdata  <= {AXI_DATA_WIDTH{1'b0}};
+                            m_axi_wstrb  <= {AXI_KEEP_WIDTH{1'b0}};
+                            m_axi_wlast  <= (burst_index + 32'd1 == burst_beats);
+                            m_axi_wvalid <= 1'b1;
+                        end
+
+                        if (w_handshake) begin
+                            m_axi_wvalid    <= 1'b0;
+                            bytes_written   <= bytes_written + bytes_this_beat;
+                            beats_written   <= beats_written + 32'd1;
+                            beats_remaining <= beats_remaining - 32'd1;
+                            burst_index     <= burst_index + 32'd1;
+
+                            if (m_axi_wlast) begin
+                                m_axi_bready <= 1'b1;
+                                state        <= ST_B;
+                            end
+                        end
+                    end
+
+                    ST_B: begin
+                        if (m_axi_bvalid && m_axi_bready) begin
+                            m_axi_bready <= 1'b0;
+                            if (m_axi_bresp != 2'b00) begin
+                                error <= 1'b1;
+                            end
+
+                            cur_addr <= cur_addr + (burst_beats << AXI_BEAT_SHIFT);
+                            if (beats_remaining == 32'd0 ||
+                                (TLAST_STOP != 0 && stream_last_seen)) begin
+                                busy  <= 1'b0;
+                                done  <= 1'b1;
+                                state <= ST_IDLE;
+                            end else begin
+                                state <= ST_AW;
+                            end
+                        end
+                    end
+
+                    default: begin
+                        state <= ST_IDLE;
+                    end
+                endcase
+            end
+        end
+    end
+
+endmodule
+`timescale 1ns / 1ps
+
+// byte_skip_adapter: discard the first skip_bytes bytes (latched at start)
+// from an 8-bit AXI-Stream, then pass remaining bytes through unchanged.
+// Upstream bytes are always consumed (tready=1) while skipping.
+module byte_skip_adapter #(
+    parameter integer SKIP_WIDTH = 6
+) (
+    input  wire                   clk,
+    input  wire                   rstn,
+    input  wire                   clear,
+    input  wire                   start,
+    input  wire [SKIP_WIDTH-1:0]  skip_bytes,
+    input  wire [7:0]             s_axis_tdata,
+    input  wire [0:0]             s_axis_tkeep,
+    input  wire                   s_axis_tlast,
+    input  wire                   s_axis_tvalid,
+    output wire                   s_axis_tready,
+    output wire [7:0]             m_axis_tdata,
+    output wire [0:0]             m_axis_tkeep,
+    output wire                   m_axis_tlast,
+    output wire                   m_axis_tvalid,
+    input  wire                   m_axis_tready
+);
+
+    reg [SKIP_WIDTH-1:0] skip_r;
+    reg [SKIP_WIDTH-1:0] skipped;
+    reg                  skipping;
+
+    wire pass_through = !skipping;
+
+    assign m_axis_tdata  = s_axis_tdata;
+    assign m_axis_tkeep  = s_axis_tkeep;
+    assign m_axis_tlast  = s_axis_tlast;
+    assign m_axis_tvalid = s_axis_tvalid && pass_through;
+    assign s_axis_tready = pass_through ? m_axis_tready : 1'b1;
+
+    always @(posedge clk) begin
+        if (!rstn) begin
+            skip_r   <= {SKIP_WIDTH{1'b0}};
+            skipped  <= {SKIP_WIDTH{1'b0}};
+            skipping <= 1'b0;
+        end else if (clear) begin
+            skip_r   <= {SKIP_WIDTH{1'b0}};
+            skipped  <= {SKIP_WIDTH{1'b0}};
+            skipping <= 1'b0;
+        end else begin
+            if (start) begin
+                skip_r   <= skip_bytes;
+                skipped  <= {SKIP_WIDTH{1'b0}};
+                skipping <= (skip_bytes != {SKIP_WIDTH{1'b0}});
+            end else if (skipping && s_axis_tvalid) begin
+                if ((skipped + {{(SKIP_WIDTH-1){1'b0}}, 1'b1}) >= skip_r) begin
+                    skipping <= 1'b0;
+                    skipped  <= {SKIP_WIDTH{1'b0}};
+                end else begin
+                    skipped  <= skipped + {{(SKIP_WIDTH-1){1'b0}}, 1'b1};
+                end
+            end
+        end
+    end
+
+endmodule
+`timescale 1ns / 1ps
+
+// crc32c_streamer: accumulates CRC32c (Castagnoli, poly 0x82F63B78 reflected)
+// over a byte stream. clear resets accumulator to 0xFFFFFFFF.
+// crc_out is the running final value (XOR 0xFFFFFFFF applied).
+module crc32c_streamer (
+    input  wire        clk,
+    input  wire        rstn,
+    input  wire        clear,
+    input  wire [7:0]  data_byte,
+    input  wire        data_valid,
+    output wire [31:0] crc_out
+);
+    reg [31:0] crc_r;
+
+    function [31:0] crc32c_byte_f;
+        input [31:0] crc;
+        input [7:0]  b;
+        integer i;
+        reg [31:0] c;
+        begin
+            c = crc ^ {24'b0, b};
+            for (i = 0; i < 8; i = i + 1)
+                c = c[0] ? ((c >> 1) ^ 32'h82F63B78) : (c >> 1);
+            crc32c_byte_f = c;
+        end
+    endfunction
+
+    always @(posedge clk) begin
+        if (!rstn || clear)
+            crc_r <= 32'hFFFFFFFF;
+        else if (data_valid)
+            crc_r <= crc32c_byte_f(crc_r, data_byte);
+    end
+
+    assign crc_out = crc_r ^ 32'hFFFFFFFF;
+endmodule
+
+`timescale 1ns / 1ps
+
+// block_trailer_appender: after encoder tlast, injects 5-byte LevelDB block
+// trailer [type=0x00, masked_crc[7:0..31:24]]. CRC32c computed over content +
+// type byte. Masked CRC = rotate_right(crc,15) + 0xa282ead8.
+// ST_PASS is combinatorial passthrough; state machine drives trailer bytes.
+module block_trailer_appender (
+    input  wire        clk,
+    input  wire        rstn,
+    input  wire        clear,
+    input  wire [7:0]  s_axis_tdata,
+    input  wire [0:0]  s_axis_tkeep,
+    input  wire        s_axis_tlast,
+    input  wire        s_axis_tvalid,
+    output wire        s_axis_tready,
+    output wire [7:0]  m_axis_tdata,
+    output wire [0:0]  m_axis_tkeep,
+    output wire        m_axis_tlast,
+    output wire        m_axis_tvalid,
+    input  wire        m_axis_tready
+);
+    localparam [2:0] ST_IDLE = 3'd0;
+    localparam [2:0] ST_PASS = 3'd1;
+    localparam [2:0] ST_TYPE = 3'd2;
+    localparam [2:0] ST_CRC0 = 3'd3;
+    localparam [2:0] ST_CRC1 = 3'd4;
+    localparam [2:0] ST_CRC2 = 3'd5;
+    localparam [2:0] ST_CRC3 = 3'd6;
+
+    reg [2:0] state;
+
+    wire [31:0] crc_raw;
+    wire        crc_valid;
+    reg  [7:0]  crc_byte_r;
+
+    wire crc_clear = clear || (state == ST_IDLE);
+
+    assign crc_valid = ((state == ST_PASS) && s_axis_tvalid && m_axis_tready) ||
+                       ((state == ST_TYPE) && m_axis_tready);
+
+    always @(*) crc_byte_r = (state == ST_TYPE) ? 8'h00 : s_axis_tdata;
+
+    crc32c_streamer u_crc (
+        .clk(clk), .rstn(rstn), .clear(crc_clear),
+        .data_byte(crc_byte_r), .data_valid(crc_valid),
+        .crc_out(crc_raw)
+    );
+
+    wire [31:0] crc_masked = {crc_raw[14:0], crc_raw[31:15]} + 32'ha282ead8;
+
+    always @(posedge clk) begin
+        if (!rstn || clear)
+            state <= ST_IDLE;
+        else case (state)
+            ST_IDLE: if (s_axis_tvalid)                                   state <= ST_PASS;
+            ST_PASS: if (s_axis_tvalid && m_axis_tready && s_axis_tlast)  state <= ST_TYPE;
+            ST_TYPE: if (m_axis_tready)                                   state <= ST_CRC0;
+            ST_CRC0: if (m_axis_tready)                                   state <= ST_CRC1;
+            ST_CRC1: if (m_axis_tready)                                   state <= ST_CRC2;
+            ST_CRC2: if (m_axis_tready)                                   state <= ST_CRC3;
+            ST_CRC3: if (m_axis_tready)                                   state <= ST_IDLE;
+            default:                                                       state <= ST_IDLE;
+        endcase
+    end
+
+    assign s_axis_tready = (state == ST_PASS) ? m_axis_tready : 1'b0;
+
+    assign m_axis_tvalid = (state == ST_PASS) ? s_axis_tvalid :
+                           (state == ST_TYPE || state == ST_CRC0 ||
+                            state == ST_CRC1 || state == ST_CRC2 ||
+                            state == ST_CRC3) ? 1'b1 : 1'b0;
+
+    assign m_axis_tdata  = (state == ST_PASS) ? s_axis_tdata    :
+                           (state == ST_TYPE)  ? 8'h00            :
+                           (state == ST_CRC0)  ? crc_masked[7:0]  :
+                           (state == ST_CRC1)  ? crc_masked[15:8] :
+                           (state == ST_CRC2)  ? crc_masked[23:16]:
+                                                 crc_masked[31:24];
+
+    assign m_axis_tkeep = 1'b1;
+    assign m_axis_tlast = (state == ST_CRC3) ? 1'b1 : 1'b0;
+endmodule

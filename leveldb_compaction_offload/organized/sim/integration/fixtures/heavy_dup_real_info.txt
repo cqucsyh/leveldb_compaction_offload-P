@@ -1,0 +1,10 @@
+scenario=heavy_dup_real
+src0_size=812
+src1_size=905
+src0_blocks=6
+src1_blocks=6
+src0_records=24
+src1_records=24
+block_pairs=6
+expected_merged=32
+expected_dropped=16

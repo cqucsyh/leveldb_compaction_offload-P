@@ -1,0 +1,10 @@
+scenario=interleave
+src0_size=782
+src1_size=782
+src0_blocks=6
+src1_blocks=6
+src0_records=24
+src1_records=24
+block_pairs=6
+expected_merged=48
+expected_dropped=0

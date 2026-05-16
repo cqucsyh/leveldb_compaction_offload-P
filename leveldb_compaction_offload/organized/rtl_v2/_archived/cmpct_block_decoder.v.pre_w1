@@ -1,0 +1,756 @@
+`timescale 1ns / 1ps
+
+module real_data_block_record_decoder #(
+    parameter integer MAX_BLOCK_BYTES = 4096,
+    parameter integer MAX_KEY_BYTES   = 256
+) (
+    input  wire        clk,
+    input  wire        rstn,
+    input  wire        clear,
+    input  wire        start,
+    input  wire [31:0] block_byte_count,  // OPT-3A: externally provided block size
+    input  wire [7:0]  s_axis_tdata,
+    input  wire [0:0]  s_axis_tkeep,
+    input  wire        s_axis_tlast,
+    input  wire        s_axis_tvalid,
+    output wire        s_axis_tready,
+    output reg         busy,
+    output reg         done,
+    output reg         error,
+    output reg         record_valid,
+    input  wire        record_ready,
+    output reg  [15:0] record_key_len,
+    output reg  [15:0] record_value_len,
+    output reg  [15:0] record_shared_bytes,
+    output reg  [15:0] record_non_shared_bytes,
+    output wire [7:0]  m_axis_tdata,
+    output wire [0:0]  m_axis_tkeep,
+    output wire        m_axis_tlast,
+    output wire        m_axis_tvalid,
+    input  wire        m_axis_tready,
+    output reg  [31:0] decoded_entry_count,
+    output reg  [31:0] restart_count,
+    output reg  [31:0] restart_entry_count,
+    output reg  [31:0] shared_key_bytes_total,
+    output reg  [31:0] unshared_key_bytes_total,
+    output reg  [31:0] value_bytes_total,
+    output reg  [15:0] last_key_len,
+    output reg  [15:0] last_value_len,
+    output reg  [15:0] last_shared_bytes,
+    output reg  [15:0] last_non_shared_bytes,
+    output reg  [31:0] restart_array_offset
+);
+
+    localparam [4:0] ST_IDLE               = 5'd0;
+    // OPT-3A: ST_CAPTURE / ST_PREPARE removed from parse FSM;
+    // capture runs as a separate concurrent process.
+    localparam [4:0] ST_FETCH_FIXED32      = 5'd3;
+    localparam [4:0] ST_CONSUME_FIXED32    = 5'd4;
+    localparam [4:0] ST_FETCH_SHARED       = 5'd5;
+    localparam [4:0] ST_CONSUME_SHARED     = 5'd6;
+    localparam [4:0] ST_FETCH_UNSHARED     = 5'd7;
+    localparam [4:0] ST_CONSUME_UNSHARED   = 5'd8;
+    localparam [4:0] ST_FETCH_VALUE_LEN    = 5'd9;
+    localparam [4:0] ST_CONSUME_VALUE_LEN  = 5'd10;
+    localparam [4:0] ST_VALIDATE_ENTRY     = 5'd11;
+    localparam [4:0] ST_PREP_EMIT_UNSHARED = 5'd12; // OPT-A1: replaced ST_COPY_KEY
+    localparam [4:0] ST_EMIT_ENTRY         = 5'd13;
+    localparam [4:0] ST_BEGIN_RESTART_SCAN = 5'd14;
+    localparam [4:0] ST_EMIT_KEY_BYTES     = 5'd15;
+    localparam [4:0] ST_EMIT_VALUE_BYTES   = 5'd16;
+    localparam [4:0] ST_PREP_EMIT_VALUE    = 5'd17;
+    localparam [4:0] ST_EMIT_UNSHARED_KEY  = 5'd18;  // OPT-A1: replaced ST_COPY_KEY_STORE
+
+    localparam       FIXED32_MODE_COUNT  = 1'b0;
+    localparam       FIXED32_MODE_OFFSET = 1'b1;
+
+    reg [4:0]  state;
+    localparam BMEM_AW = $clog2(MAX_BLOCK_BYTES);
+    reg [7:0] prev_key_mem [0:MAX_KEY_BYTES-1];
+    // OPT-A1: curr_key_mem removed; unshared key bytes read directly from block_mem BRAM during emit
+    // OPT-3A: capture-side registers (driven by separate always block)
+    reg [31:0] cap_wptr;      // how many bytes captured so far
+    reg        cap_done;      // capture complete
+    reg        cap_active;    // capture in progress
+    reg        ra_valid;      // restart_array_offset is valid
+    reg [31:0] ra_offset_r;   // computed restart_array_offset from capture
+    reg [31:0] rc_count_r;    // computed restart_count from capture
+    reg [31:0] tail_accum;    // shift register for last 4 bytes (restart_count LE)
+    reg        cap_error;     // capture overflow error
+    reg [31:0] parse_index;
+    reg [31:0] shared_len;
+    reg [31:0] unshared_len;
+    reg [31:0] value_len;
+    reg [31:0] prev_key_len;
+    reg [31:0] key_copy_index;
+    reg [31:0] varint_accum;
+    reg [5:0]  varint_shift;
+    reg [2:0]  varint_bytes;
+    reg [31:0] restart_scan_index;
+    reg [31:0] restart_prev_offset;
+    reg [31:0] fixed32_base_addr;
+    reg [31:0] fixed32_accum;
+    reg [1:0]  fixed32_byte_index;
+    reg        fixed32_mode;
+    wire [7:0] fetched_byte;
+    reg [31:0] key_base_index;
+    reg [31:0] value_base_index;
+    reg [31:0] next_entry_index;
+    reg [31:0] emit_index;
+
+    reg [31:0] next_varint_value;
+    reg [31:0] next_fixed32_value;
+
+    wire [31:0] current_key_len_w;
+    wire        output_accept;
+
+    // ---- BRAM via cmpct_sdpram instantiation ----
+    wire bram_we_comb = s_axis_tvalid && s_axis_tkeep[0] && s_axis_tready;
+    wire entries_done_w = ra_valid && (parse_index >= ra_offset_r);
+    wire varint_overflow_w = (varint_shift >= 6'd28) || (varint_bytes == 3'd4);
+
+    reg [31:0] bram_rd_addr_comb;
+    reg        bram_rd_en_comb;
+
+    always @(*) begin
+        bram_rd_en_comb = 1'b0;
+        bram_rd_addr_comb = parse_index;
+        if (busy && !error && !cap_error) begin
+            case (state)
+                ST_FETCH_FIXED32: begin
+                    if (fixed32_base_addr + {30'd0, fixed32_byte_index} < cap_wptr) begin
+                        bram_rd_addr_comb = fixed32_base_addr + {30'd0, fixed32_byte_index};
+                        bram_rd_en_comb = 1'b1;
+                    end
+                end
+                ST_FETCH_SHARED: begin
+                    if (!entries_done_w && parse_index < cap_wptr)
+                        bram_rd_en_comb = 1'b1;
+                end
+                ST_CONSUME_SHARED: begin
+                    if (fetched_byte[7]) begin
+                        if (!varint_overflow_w && parse_index < cap_wptr)
+                            bram_rd_en_comb = 1'b1;
+                    end else if (!entries_done_w && parse_index < cap_wptr)
+                        bram_rd_en_comb = 1'b1;
+                end
+                ST_FETCH_UNSHARED: begin
+                    if (!entries_done_w && parse_index < cap_wptr)
+                        bram_rd_en_comb = 1'b1;
+                end
+                ST_CONSUME_UNSHARED: begin
+                    if (fetched_byte[7]) begin
+                        if (!varint_overflow_w && parse_index < cap_wptr)
+                            bram_rd_en_comb = 1'b1;
+                    end else if (!entries_done_w && parse_index < cap_wptr)
+                        bram_rd_en_comb = 1'b1;
+                end
+                ST_FETCH_VALUE_LEN: begin
+                    if (!entries_done_w && parse_index < cap_wptr)
+                        bram_rd_en_comb = 1'b1;
+                end
+                ST_CONSUME_VALUE_LEN: begin
+                    if (fetched_byte[7] && !varint_overflow_w && parse_index < cap_wptr)
+                        bram_rd_en_comb = 1'b1;
+                end
+                // OPT-A1: direct BRAM read for unshared key emit (replaces ST_COPY_KEY)
+                ST_PREP_EMIT_UNSHARED: begin
+                    if (key_base_index + key_copy_index < cap_wptr) begin
+                        bram_rd_addr_comb = key_base_index + key_copy_index;
+                        bram_rd_en_comb = 1'b1;
+                    end
+                end
+                ST_EMIT_UNSHARED_KEY: begin
+                    if (output_accept && key_copy_index + 32'd1 < unshared_len &&
+                        key_base_index + key_copy_index + 32'd1 < cap_wptr) begin
+                        bram_rd_addr_comb = key_base_index + key_copy_index + 32'd1;
+                        bram_rd_en_comb = 1'b1;
+                    end
+                end
+                ST_PREP_EMIT_VALUE: begin
+                    if (value_base_index + emit_index < cap_wptr) begin
+                        bram_rd_addr_comb = value_base_index + emit_index;
+                        bram_rd_en_comb = 1'b1;
+                    end
+                end
+                ST_EMIT_VALUE_BYTES: begin
+                    if (output_accept && emit_index + 32'd1 < value_len &&
+                        value_base_index + emit_index + 32'd1 < cap_wptr) begin
+                        bram_rd_addr_comb = value_base_index + emit_index + 32'd1;
+                        bram_rd_en_comb = 1'b1;
+                    end
+                end
+                default: ;
+            endcase
+        end
+    end
+
+    cmpct_sdpram #(
+        .DEPTH (MAX_BLOCK_BYTES),
+        .WIDTH (8)
+    ) u_block_mem (
+        .clk   (clk),
+        .we    (bram_we_comb),
+        .waddr (cap_wptr[BMEM_AW-1:0]),
+        .wdata (s_axis_tdata),
+        .re    (bram_rd_en_comb),
+        .raddr (bram_rd_addr_comb[BMEM_AW-1:0]),
+        .rdata (fetched_byte)
+    );
+
+    integer i;
+
+    function [31:0] insert_u8_le;
+        input [31:0] accum;
+        input [7:0]  byte_val;
+        input [1:0]  byte_idx;
+        begin
+            case (byte_idx)
+                2'd0: insert_u8_le = {accum[31:8],  byte_val};
+                2'd1: insert_u8_le = {accum[31:16], byte_val, accum[7:0]};
+                2'd2: insert_u8_le = {accum[31:24], byte_val, accum[15:0]};
+                default: insert_u8_le = {byte_val, accum[23:0]};
+            endcase
+        end
+    endfunction
+
+    // OPT-3A: s_axis_tready driven by capture process, not parse FSM
+    assign s_axis_tready = cap_active && !cap_error && (cap_wptr < MAX_BLOCK_BYTES);
+    assign current_key_len_w = shared_len + unshared_len;
+    // OPT-A1: key_emit_byte removed; shared prefix read from prev_key_mem,
+    // unshared suffix read from BRAM fetched_byte directly.
+    assign m_axis_tdata = (state == ST_EMIT_KEY_BYTES) ? prev_key_mem[emit_index] :
+                          ((state == ST_EMIT_UNSHARED_KEY) || (state == ST_EMIT_VALUE_BYTES)) ? fetched_byte :
+                          8'd0;
+    assign m_axis_tkeep = 1'b1;
+    assign m_axis_tvalid = busy && !error && ((state == ST_EMIT_KEY_BYTES) || (state == ST_EMIT_UNSHARED_KEY) || (state == ST_EMIT_VALUE_BYTES));
+    assign output_accept = m_axis_tvalid && m_axis_tready;
+    assign m_axis_tlast = ((state == ST_EMIT_KEY_BYTES) && (unshared_len == 32'd0) && (value_len == 32'd0) && (emit_index + 32'd1 == shared_len)) ||
+                          ((state == ST_EMIT_UNSHARED_KEY) && (value_len == 32'd0) && (key_copy_index + 32'd1 == unshared_len)) ||
+                          ((state == ST_EMIT_VALUE_BYTES) && (emit_index + 32'd1 == value_len));
+
+    // =========================================================================
+    // OPT-3A: Merged capture + parse process — single always block so that
+    // Vivado can infer block RAM for block_mem.  Capture sub-process runs
+    // before the FSM case statement (last-NB-wins for start-cycle overrides).
+    // =========================================================================
+    always @(posedge clk) begin
+        if (!rstn) begin
+            cap_wptr     <= 32'd0;
+            cap_done     <= 1'b0;
+            cap_active   <= 1'b0;
+            ra_valid     <= 1'b0;
+            ra_offset_r  <= 32'd0;
+            rc_count_r   <= 32'd0;
+            tail_accum   <= 32'd0;
+            cap_error    <= 1'b0;
+            busy                     <= 1'b0;
+            done                     <= 1'b0;
+            error                    <= 1'b0;
+            record_valid             <= 1'b0;
+            record_key_len           <= 16'd0;
+            record_value_len         <= 16'd0;
+            record_shared_bytes      <= 16'd0;
+            record_non_shared_bytes  <= 16'd0;
+            decoded_entry_count      <= 32'd0;
+            restart_count            <= 32'd0;
+            restart_entry_count      <= 32'd0;
+            shared_key_bytes_total   <= 32'd0;
+            unshared_key_bytes_total <= 32'd0;
+            value_bytes_total        <= 32'd0;
+            last_key_len             <= 16'd0;
+            last_value_len           <= 16'd0;
+            last_shared_bytes        <= 16'd0;
+            last_non_shared_bytes    <= 16'd0;
+            restart_array_offset     <= 32'd0;
+            state                    <= ST_IDLE;
+            parse_index              <= 32'd0;
+            shared_len               <= 32'd0;
+            unshared_len             <= 32'd0;
+            value_len                <= 32'd0;
+            prev_key_len             <= 32'd0;
+            key_copy_index           <= 32'd0;
+            varint_accum             <= 32'd0;
+            varint_shift             <= 6'd0;
+            varint_bytes             <= 3'd0;
+            restart_scan_index       <= 32'd0;
+            restart_prev_offset      <= 32'd0;
+            fixed32_base_addr        <= 32'd0;
+            fixed32_accum            <= 32'd0;
+            fixed32_byte_index       <= 2'd0;
+            fixed32_mode             <= FIXED32_MODE_COUNT;
+            key_base_index           <= 32'd0;
+            value_base_index         <= 32'd0;
+            next_entry_index         <= 32'd0;
+            emit_index               <= 32'd0;
+        end else if (clear) begin
+            cap_wptr     <= 32'd0;
+            cap_done     <= 1'b0;
+            cap_active   <= 1'b0;
+            ra_valid     <= 1'b0;
+            ra_offset_r  <= 32'd0;
+            rc_count_r   <= 32'd0;
+            tail_accum   <= 32'd0;
+            cap_error    <= 1'b0;
+            busy                     <= 1'b0;
+            done                     <= 1'b0;
+            error                    <= 1'b0;
+            record_valid             <= 1'b0;
+            record_key_len           <= 16'd0;
+            record_value_len         <= 16'd0;
+            record_shared_bytes      <= 16'd0;
+            record_non_shared_bytes  <= 16'd0;
+            decoded_entry_count      <= 32'd0;
+            restart_count            <= 32'd0;
+            restart_entry_count      <= 32'd0;
+            shared_key_bytes_total   <= 32'd0;
+            unshared_key_bytes_total <= 32'd0;
+            value_bytes_total        <= 32'd0;
+            last_key_len             <= 16'd0;
+            last_value_len           <= 16'd0;
+            last_shared_bytes        <= 16'd0;
+            last_non_shared_bytes    <= 16'd0;
+            restart_array_offset     <= 32'd0;
+            state                    <= ST_IDLE;
+            parse_index              <= 32'd0;
+            shared_len               <= 32'd0;
+            unshared_len             <= 32'd0;
+            value_len                <= 32'd0;
+            prev_key_len             <= 32'd0;
+            key_copy_index           <= 32'd0;
+            varint_accum             <= 32'd0;
+            varint_shift             <= 6'd0;
+            varint_bytes             <= 3'd0;
+            restart_scan_index       <= 32'd0;
+            restart_prev_offset      <= 32'd0;
+            fixed32_base_addr        <= 32'd0;
+            fixed32_accum            <= 32'd0;
+            fixed32_byte_index       <= 2'd0;
+            fixed32_mode             <= FIXED32_MODE_COUNT;
+            key_base_index           <= 32'd0;
+            value_base_index         <= 32'd0;
+            next_entry_index         <= 32'd0;
+            emit_index               <= 32'd0;
+        end else begin
+            record_valid <= 1'b0;
+            done <= 1'b0;
+            next_varint_value = 32'd0;
+            next_fixed32_value = 32'd0;
+
+            // ---- Capture sub-process (writes block_mem, concurrent with parse) ----
+            if (start && !busy) begin
+                cap_wptr     <= 32'd0;
+                cap_done     <= 1'b0;
+                cap_active   <= 1'b1;
+                ra_valid     <= 1'b0;
+                ra_offset_r  <= 32'd0;
+                rc_count_r   <= 32'd0;
+                tail_accum   <= 32'd0;
+                cap_error    <= 1'b0;
+            end else if (cap_active && !cap_error) begin
+                if (s_axis_tvalid && s_axis_tkeep[0] && s_axis_tready) begin
+                    tail_accum <= {s_axis_tdata, tail_accum[31:8]};
+                    if ((cap_wptr == (MAX_BLOCK_BYTES - 1)) && !s_axis_tlast) begin
+                        cap_error  <= 1'b1;
+                        cap_active <= 1'b0;
+                    end else if (s_axis_tlast) begin
+                        cap_done   <= 1'b1;
+                        cap_active <= 1'b0;
+                        cap_wptr   <= cap_wptr + 32'd1;
+                    end else begin
+                        cap_wptr   <= cap_wptr + 32'd1;
+                    end
+                end
+            end
+
+            // One cycle after cap_done: tail_accum is stable, compute restart info
+            if (cap_done && !ra_valid && !cap_error) begin
+                if (cap_wptr < 32'd8) begin
+                    cap_error <= 1'b1;
+                end else if (tail_accum == 32'd0) begin
+                    cap_error <= 1'b1;
+                end else if (((tail_accum + 32'd1) << 2) > cap_wptr) begin
+                    cap_error <= 1'b1;
+                end else begin
+                    rc_count_r  <= tail_accum;
+                    ra_offset_r <= cap_wptr - ((tail_accum + 32'd1) << 2);
+                    ra_valid    <= 1'b1;
+                end
+            end
+
+            // ---- Parse FSM ----
+            if (start && !busy) begin
+                busy                     <= 1'b1;
+                done                     <= 1'b0;
+                error                    <= 1'b0;
+                record_valid             <= 1'b0;
+                record_key_len           <= 16'd0;
+                record_value_len         <= 16'd0;
+                record_shared_bytes      <= 16'd0;
+                record_non_shared_bytes  <= 16'd0;
+                decoded_entry_count      <= 32'd0;
+                restart_count            <= 32'd0;
+                restart_entry_count      <= 32'd0;
+                shared_key_bytes_total   <= 32'd0;
+                unshared_key_bytes_total <= 32'd0;
+                value_bytes_total        <= 32'd0;
+                last_key_len             <= 16'd0;
+                last_value_len           <= 16'd0;
+                last_shared_bytes        <= 16'd0;
+                last_non_shared_bytes    <= 16'd0;
+                restart_array_offset     <= 32'd0;
+                state                    <= ST_FETCH_SHARED;
+                parse_index              <= 32'd0;
+                shared_len               <= 32'd0;
+                unshared_len             <= 32'd0;
+                value_len                <= 32'd0;
+                prev_key_len             <= 32'd0;
+                key_copy_index           <= 32'd0;
+                varint_accum             <= 32'd0;
+                varint_shift             <= 6'd0;
+                varint_bytes             <= 3'd0;
+                restart_scan_index       <= 32'd0;
+                restart_prev_offset      <= 32'd0;
+                fixed32_base_addr        <= 32'd0;
+                fixed32_accum            <= 32'd0;
+                fixed32_byte_index       <= 2'd0;
+                fixed32_mode             <= FIXED32_MODE_OFFSET;
+                key_base_index           <= 32'd0;
+                value_base_index         <= 32'd0;
+                next_entry_index         <= 32'd0;
+                emit_index               <= 32'd0;
+            end else if (busy && !error) begin
+                if (cap_error) begin
+                    busy  <= 1'b0;
+                    error <= 1'b1;
+                    state <= ST_IDLE;
+                end else begin
+                case (state)
+                    // OPT-3A: ST_FETCH_FIXED32 only used for restart offset
+                    // validation (FIXED32_MODE_OFFSET); restart_count extraction
+                    // is handled by the capture process.
+                    ST_FETCH_FIXED32: begin
+                        if (fixed32_base_addr + {30'd0, fixed32_byte_index} < cap_wptr) begin
+                            state <= ST_CONSUME_FIXED32;
+                        end
+                        // else: stall until capture catches up
+                    end
+
+                    ST_CONSUME_FIXED32: begin
+                        next_fixed32_value = insert_u8_le(fixed32_accum, fetched_byte, fixed32_byte_index);
+                        if (fixed32_byte_index != 2'd3) begin
+                            fixed32_accum      <= next_fixed32_value;
+                            fixed32_byte_index <= fixed32_byte_index + 2'd1;
+                            state              <= ST_FETCH_FIXED32;
+                        end else begin
+                            // FIXED32_MODE_OFFSET: validate restart offset
+                            if ((restart_scan_index == 32'd0 && next_fixed32_value != 32'd0) ||
+                                (next_fixed32_value >= restart_array_offset) ||
+                                (restart_scan_index != 32'd0 && next_fixed32_value <= restart_prev_offset)) begin
+                                busy  <= 1'b0;
+                                error <= 1'b1;
+                                state <= ST_IDLE;
+                            end else begin
+                                restart_prev_offset <= next_fixed32_value;
+                                restart_scan_index  <= restart_scan_index + 32'd1;
+                                state               <= ST_BEGIN_RESTART_SCAN;
+                            end
+                        end
+                    end
+
+                    // OPT-3A: entries-done check uses ra_valid/ra_offset_r;
+                    // data-available check uses cap_wptr.
+                    ST_FETCH_SHARED: begin
+                        if (ra_valid && parse_index >= ra_offset_r) begin
+                            // All entries parsed; latch restart info and scan offsets
+                            restart_count        <= rc_count_r;
+                            restart_array_offset <= ra_offset_r;
+                            restart_scan_index   <= 32'd0;
+                            restart_prev_offset  <= 32'd0;
+                            state                <= ST_BEGIN_RESTART_SCAN;
+                        end else if (parse_index < cap_wptr) begin
+                            parse_index  <= parse_index + 32'd1;
+                            state        <= ST_CONSUME_SHARED;
+                        end
+                        // else: stall (data not yet captured)
+                    end
+
+                    ST_CONSUME_SHARED: begin
+                        if (fetched_byte[7]) begin
+                            if ((varint_shift >= 6'd28) || (varint_bytes == 3'd4)) begin
+                                busy  <= 1'b0;
+                                error <= 1'b1;
+                                state <= ST_IDLE;
+                            end else begin
+                                varint_accum <= varint_accum | ({25'd0, fetched_byte[6:0]} << varint_shift);
+                                varint_shift <= varint_shift + 6'd7;
+                                varint_bytes <= varint_bytes + 3'd1;
+                                // OPT-3A: inline prefetch with cap_wptr guard
+                                if (parse_index < cap_wptr) begin
+                                    parse_index  <= parse_index + 32'd1;
+                                end else begin
+                                    state <= ST_FETCH_SHARED;
+                                end
+                            end
+                        end else begin
+                            next_varint_value = varint_accum | ({24'd0, fetched_byte} << varint_shift);
+                            shared_len   <= next_varint_value;
+                            varint_accum <= 32'd0;
+                            varint_shift <= 6'd0;
+                            varint_bytes <= 3'd0;
+                            if (ra_valid && parse_index >= ra_offset_r) begin
+                                busy  <= 1'b0;
+                                error <= 1'b1;
+                                state <= ST_IDLE;
+                            end else if (parse_index < cap_wptr) begin
+                                parse_index  <= parse_index + 32'd1;
+                                state        <= ST_CONSUME_UNSHARED;
+                            end else begin
+                                state <= ST_FETCH_UNSHARED;
+                            end
+                        end
+                    end
+
+                    ST_FETCH_UNSHARED: begin
+                        if (ra_valid && parse_index >= ra_offset_r) begin
+                            busy  <= 1'b0;
+                            error <= 1'b1;
+                            state <= ST_IDLE;
+                        end else if (parse_index < cap_wptr) begin
+                            parse_index  <= parse_index + 32'd1;
+                            state        <= ST_CONSUME_UNSHARED;
+                        end
+                        // else: stall
+                    end
+
+                    ST_CONSUME_UNSHARED: begin
+                        if (fetched_byte[7]) begin
+                            if ((varint_shift >= 6'd28) || (varint_bytes == 3'd4)) begin
+                                busy  <= 1'b0;
+                                error <= 1'b1;
+                                state <= ST_IDLE;
+                            end else begin
+                                varint_accum <= varint_accum | ({25'd0, fetched_byte[6:0]} << varint_shift);
+                                varint_shift <= varint_shift + 6'd7;
+                                varint_bytes <= varint_bytes + 3'd1;
+                                if (parse_index < cap_wptr) begin
+                                    parse_index  <= parse_index + 32'd1;
+                                end else begin
+                                    state <= ST_FETCH_UNSHARED;
+                                end
+                            end
+                        end else begin
+                            next_varint_value = varint_accum | ({24'd0, fetched_byte} << varint_shift);
+                            unshared_len <= next_varint_value;
+                            varint_accum <= 32'd0;
+                            varint_shift <= 6'd0;
+                            varint_bytes <= 3'd0;
+                            if (ra_valid && parse_index >= ra_offset_r) begin
+                                busy  <= 1'b0;
+                                error <= 1'b1;
+                                state <= ST_IDLE;
+                            end else if (parse_index < cap_wptr) begin
+                                parse_index  <= parse_index + 32'd1;
+                                state        <= ST_CONSUME_VALUE_LEN;
+                            end else begin
+                                state <= ST_FETCH_VALUE_LEN;
+                            end
+                        end
+                    end
+
+                    ST_FETCH_VALUE_LEN: begin
+                        if (ra_valid && parse_index >= ra_offset_r) begin
+                            busy  <= 1'b0;
+                            error <= 1'b1;
+                            state <= ST_IDLE;
+                        end else if (parse_index < cap_wptr) begin
+                            parse_index  <= parse_index + 32'd1;
+                            state        <= ST_CONSUME_VALUE_LEN;
+                        end
+                        // else: stall
+                    end
+
+                    ST_CONSUME_VALUE_LEN: begin
+                        if (fetched_byte[7]) begin
+                            if ((varint_shift >= 6'd28) || (varint_bytes == 3'd4)) begin
+                                busy  <= 1'b0;
+                                error <= 1'b1;
+                                state <= ST_IDLE;
+                            end else begin
+                                varint_accum <= varint_accum | ({25'd0, fetched_byte[6:0]} << varint_shift);
+                                varint_shift <= varint_shift + 6'd7;
+                                varint_bytes <= varint_bytes + 3'd1;
+                                if (parse_index < cap_wptr) begin
+                                    parse_index  <= parse_index + 32'd1;
+                                end else begin
+                                    state <= ST_FETCH_VALUE_LEN;
+                                end
+                            end
+                        end else begin
+                            next_varint_value = varint_accum | ({24'd0, fetched_byte} << varint_shift);
+                            value_len    <= next_varint_value;
+                            varint_accum <= 32'd0;
+                            varint_shift <= 6'd0;
+                            varint_bytes <= 3'd0;
+                            state        <= ST_VALIDATE_ENTRY;
+                        end
+                    end
+
+                    ST_VALIDATE_ENTRY: begin
+                        if ((shared_len > prev_key_len) ||
+                            ((shared_len + unshared_len) > MAX_KEY_BYTES) ||
+                            (ra_valid && ((parse_index + unshared_len + value_len) > ra_offset_r))) begin
+                            busy  <= 1'b0;
+                            error <= 1'b1;
+                            state <= ST_IDLE;
+                        end else begin
+                            key_base_index   <= parse_index;
+                            value_base_index <= parse_index + unshared_len;
+                            next_entry_index <= parse_index + unshared_len + value_len;
+                            key_copy_index   <= 32'd0;
+                            // OPT-A1: skip copy phase entirely; emit directly
+                            state <= ST_EMIT_ENTRY;
+                        end
+                    end
+
+                    // OPT-A1: prep first BRAM read for unshared key byte stream
+                    ST_PREP_EMIT_UNSHARED: begin
+                        if (key_base_index + key_copy_index < cap_wptr) begin
+                            state <= ST_EMIT_UNSHARED_KEY;
+                        end
+                        // else: stall until capture catches up
+                    end
+
+                    // OPT-A1: emit unshared key bytes from BRAM at 1 byte/cycle
+                    // with pipelined prefetch (same pattern as ST_EMIT_VALUE_BYTES)
+                    ST_EMIT_UNSHARED_KEY: begin
+                        if (output_accept) begin
+                            // Update prev_key_mem with the unshared key byte
+                            prev_key_mem[shared_len + key_copy_index] <= fetched_byte;
+                            if (key_copy_index + 32'd1 < unshared_len) begin
+                                // More unshared bytes: prefetch next if available
+                                if (key_base_index + key_copy_index + 32'd1 < cap_wptr) begin
+                                    key_copy_index <= key_copy_index + 32'd1;
+                                end else begin
+                                    key_copy_index <= key_copy_index + 32'd1;
+                                    state <= ST_PREP_EMIT_UNSHARED;
+                                end
+                            end else begin
+                                // Unshared key done
+                                if (value_len != 32'd0) begin
+                                    emit_index <= 32'd0;
+                                    state      <= ST_PREP_EMIT_VALUE;
+                                end else begin
+                                    state <= ST_FETCH_SHARED;
+                                end
+                            end
+                        end
+                    end
+
+                    ST_EMIT_ENTRY: begin
+                        if (record_ready) begin
+                            decoded_entry_count      <= decoded_entry_count + 32'd1;
+                            shared_key_bytes_total   <= shared_key_bytes_total + shared_len;
+                            unshared_key_bytes_total <= unshared_key_bytes_total + unshared_len;
+                            value_bytes_total        <= value_bytes_total + value_len;
+                            if (shared_len == 32'd0) begin
+                                restart_entry_count <= restart_entry_count + 32'd1;
+                            end
+                            prev_key_len         <= current_key_len_w;
+                            last_key_len         <= current_key_len_w[15:0];
+                            last_value_len       <= value_len[15:0];
+                            last_shared_bytes    <= shared_len[15:0];
+                            last_non_shared_bytes <= unshared_len[15:0];
+                            record_key_len       <= current_key_len_w[15:0];
+                            record_value_len     <= value_len[15:0];
+                            record_shared_bytes  <= shared_len[15:0];
+                            record_non_shared_bytes <= unshared_len[15:0];
+                            record_valid         <= 1'b1;
+                            parse_index          <= next_entry_index;
+                            emit_index           <= 32'd0;
+                            key_copy_index       <= 32'd0;
+                            // OPT-A1: route to shared/unshared/value phases
+                            if (shared_len != 32'd0) begin
+                                state <= ST_EMIT_KEY_BYTES;
+                            end else if (unshared_len != 32'd0) begin
+                                state <= ST_PREP_EMIT_UNSHARED;
+                            end else if (value_len != 32'd0) begin
+                                state <= ST_PREP_EMIT_VALUE;
+                            end else begin
+                                state <= ST_FETCH_SHARED;
+                            end
+                        end
+                    end
+
+                    // OPT-A1: emit shared key prefix from prev_key_mem (0 BRAM latency)
+                    ST_EMIT_KEY_BYTES: begin
+                        if (output_accept) begin
+                            // Shared prefix already in prev_key_mem — no write needed
+                            if (emit_index + 32'd1 < shared_len) begin
+                                emit_index <= emit_index + 32'd1;
+                            end else begin
+                                // Shared prefix done; route to next phase
+                                if (unshared_len != 32'd0) begin
+                                    key_copy_index <= 32'd0;
+                                    state <= ST_PREP_EMIT_UNSHARED;
+                                end else if (value_len != 32'd0) begin
+                                    emit_index <= 32'd0;
+                                    state      <= ST_PREP_EMIT_VALUE;
+                                end else begin
+                                    state <= ST_FETCH_SHARED;
+                                end
+                            end
+                        end
+                    end
+
+                    // OPT-3A: stall if value data not yet captured
+                    ST_PREP_EMIT_VALUE: begin
+                        if (value_base_index + emit_index < cap_wptr) begin
+                            state        <= ST_EMIT_VALUE_BYTES;
+                        end
+                        // else: stall
+                    end
+
+                    ST_EMIT_VALUE_BYTES: begin
+                        if (output_accept) begin
+                            if (emit_index + 32'd1 < value_len) begin
+                                // OPT-3A: inline prefetch with cap_wptr guard
+                                if (value_base_index + emit_index + 32'd1 < cap_wptr) begin
+                                    emit_index   <= emit_index + 32'd1;
+                                end else begin
+                                    emit_index <= emit_index + 32'd1;
+                                    state      <= ST_PREP_EMIT_VALUE;
+                                end
+                            end else begin
+                                state <= ST_FETCH_SHARED;
+                            end
+                        end
+                    end
+
+                    ST_BEGIN_RESTART_SCAN: begin
+                        if (restart_scan_index < restart_count) begin
+                            fixed32_base_addr  <= restart_array_offset + (restart_scan_index << 2);
+                            fixed32_accum      <= 32'd0;
+                            fixed32_byte_index <= 2'd0;
+                            fixed32_mode       <= FIXED32_MODE_OFFSET;
+                            state              <= ST_FETCH_FIXED32;
+                        end else begin
+                            busy  <= 1'b0;
+                            done  <= 1'b1;
+                            state <= ST_IDLE;
+                        end
+                    end
+
+                    default: begin
+                        busy  <= 1'b0;
+                        error <= 1'b1;
+                        state <= ST_IDLE;
+                    end
+                endcase
+                end // cap_error else
+            end
+
+        end
+    end
+
+endmodule

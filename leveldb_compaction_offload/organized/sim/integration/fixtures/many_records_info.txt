@@ -1,0 +1,10 @@
+scenario=many_records
+src0_size=911
+src1_size=911
+src0_blocks=2
+src1_blocks=2
+src0_records=32
+src1_records=32
+block_pairs=2
+expected_merged=64
+expected_dropped=0
