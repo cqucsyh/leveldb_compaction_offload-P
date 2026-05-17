@@ -570,11 +570,11 @@ else:
     print('N/A')
 ")"
 AVG_CYC=$(( TOTAL_CYC / (PASS_COUNT > 0 ? PASS_COUNT : 1) ))
-HW_US="$(python3 -c "print(f'{${AVG_CYC}/200:.1f}')")"
+HW_US="$(python3 -c "print(f'{${AVG_CYC}/300:.1f}')")"
 HW_THRU="$(python3 -c "
 cyc=${AVG_CYC}; inp=${INPUT_PER_RUN}
 if cyc > 0:
-    us = cyc / 200.0
+    us = cyc / 300.0
     print(f'{inp / 1024 / 1024 / (us / 1e6):.1f}')
 else:
     print('N/A')
@@ -592,13 +592,13 @@ echo "    Wall time:         ${WALL_S} s"
 echo ""
 echo "  Throughput:"
 echo "    Host throughput:   ${HOST_THRU} MB/s (incl. XDMA + register overhead)"
-echo "    HW throughput:     ${HW_THRU} MB/s (pure hardware @200MHz)"
+echo "    HW throughput:     ${HW_THRU} MB/s (pure hardware @300MHz)"
 echo ""
 echo "  Hardware Performance:"
 echo "    Avg cycles/run:    ${AVG_CYC}"
 echo "    Min cycles/run:    ${MIN_CYC}"
 echo "    Max cycles/run:    ${MAX_CYC}"
-echo "    Avg HW time/run:   ${HW_US} µs (@200MHz)"
+echo "    Avg HW time/run:   ${HW_US} µs (@300MHz)"
 echo "    Input per run:     ${INPUT_PER_RUN} bytes"
 echo "    Blocks per run:    ${EXP_PAIRS} pairs"
 echo "    Records per run:   ${EXP_DEC} decoded"

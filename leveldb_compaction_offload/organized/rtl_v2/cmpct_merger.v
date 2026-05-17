@@ -79,7 +79,7 @@ module cmpct_merger #(
     localparam [3:0] ST_CAPTURE0       = 4'd3;
     localparam [3:0] ST_WAIT1_HEADER   = 4'd4;
     localparam [3:0] ST_CAPTURE1       = 4'd5;
-    localparam [3:0] ST_COMPARE_INPUTS = 4'd6;
+    localparam [3:0] ST_CMP_SETUP = 4'd6;
     localparam [3:0] ST_CHECK_KEEP     = 4'd7;
     localparam [3:0] ST_FINALIZE       = 4'd8;
     localparam [3:0] ST_EMIT_HEADER    = 4'd9;
@@ -97,6 +97,9 @@ module cmpct_merger #(
     reg       have_prev_user_key;
     reg       selected_source;
     reg       keep_selected;
+    // P10: Pre-fetch flags
+    reg       prefetched0;
+    reg       prefetched1;
 
     reg [15:0] prev_user_key_len;
     reg [15:0] compare_index;
@@ -128,14 +131,32 @@ module cmpct_merger #(
     integer idx;
     integer cmp_k;
 
-    assign s0_record_ready = busy && !error && (state == ST_WAIT0_HEADER);
+    // P10: Pre-fetch opposite source header during idle record interface cycles
+    // P14: ST_FINALIZE removed (now dead); P10 pre-fetch gates updated
+    wire p10_can_accept0 = !buf_valid0 && !source_done_seen0 && !prefetched0 && (
+        (state == ST_CAPTURE1) ||
+        (state == ST_CMP_SETUP) ||
+        (state == ST_EMIT_HEADER) || (state == ST_EMIT_PAYLOAD) ||
+        ((state == ST_STREAM_VALUE) && (selected_source == 1'b1)) ||
+        ((state == ST_DRAIN_VALUE)  && (selected_source == 1'b1)) ||
+        (state == ST_COPY_PREV_KEY)
+    );
+    wire p10_can_accept1 = !buf_valid1 && !source_done_seen1 && !prefetched1 && (
+        (state == ST_CAPTURE0) ||
+        (state == ST_CMP_SETUP) ||
+        (state == ST_EMIT_HEADER) || (state == ST_EMIT_PAYLOAD) ||
+        ((state == ST_STREAM_VALUE) && (selected_source == 1'b0)) ||
+        ((state == ST_DRAIN_VALUE)  && (selected_source == 1'b0)) ||
+        (state == ST_COPY_PREV_KEY)
+    );
+    assign s0_record_ready = busy && !error && ((state == ST_WAIT0_HEADER && !prefetched0) || p10_can_accept0);
     // OPT-CAP4: s0_axis_tready — stream_value gated by m_axis_tready (direct pass-through)
     assign s0_axis_tready  = busy && !error && (
         (state == ST_CAPTURE0) ||
         ((state == ST_STREAM_VALUE) && (selected_source == 1'b0) && m_axis_tready) ||
         ((state == ST_DRAIN_VALUE)  && (selected_source == 1'b0))
     );
-    assign s1_record_ready = busy && !error && (state == ST_WAIT1_HEADER);
+    assign s1_record_ready = busy && !error && ((state == ST_WAIT1_HEADER && !prefetched1) || p10_can_accept1);
     // OPT-CAP4: s1_axis_tready — stream_value gated by m_axis_tready (direct pass-through)
     assign s1_axis_tready  = busy && !error && (
         (state == ST_CAPTURE1) ||
@@ -273,7 +294,7 @@ module cmpct_merger #(
     localparam integer CMP_CHUNK  = MAX_USER_KEY_BYTES;
     localparam integer COPY_CHUNK = 4;  // prev_key copy width (kept at 4 to avoid MUX→write timing issue)
 
-    // -- ST_COMPARE_INPUTS: lexicographic compare key0 vs key1 --
+    // -- ST_CMP_SETUP: lexicographic compare key0 vs key1 --
     wire [15:0] cmp_min_len_w = (user_key_len0 < user_key_len1)
                                 ? user_key_len0 : user_key_len1;
     wire [CMP_CHUNK-1:0] cmp01_valid, cmp01_eq, cmp01_lt;
@@ -299,45 +320,80 @@ module cmpct_merger #(
     end
     wire cmp01_all_done = (compare_index + CMP_CHUNK >= cmp_min_len_w);
 
-    // -- ST_CHECK_KEEP: equality compare selected key vs prev_user_key --
-    wire [CMP_CHUNK-1:0] chk_valid, chk_eq;
-    genvar kg;
-    generate for (kg = 0; kg < CMP_CHUNK; kg = kg + 1) begin : g_chk
-        wire [15:0] kpos_w = compare_index + kg;
-        assign chk_valid[kg] = (kpos_w < selected_user_key_len_w);
-        assign chk_eq[kg]    = ((selected_source ? user_key_mem1[kpos_w[7:0]]
-                                                  : user_key_mem0[kpos_w[7:0]])
-                                 == prev_user_key_mem[kpos_w[7:0]]);
+    // -- P11: Pre-computed duplicate check for both sources (parallel with cmp01) --
+    wire [CMP_CHUNK-1:0] chk0_valid, chk0_eq;
+    genvar k0;
+    generate for (k0 = 0; k0 < CMP_CHUNK; k0 = k0 + 1) begin : g_chk0
+        wire [15:0] kpos_w = compare_index + k0;
+        assign chk0_valid[k0] = (kpos_w < user_key_len0);
+        assign chk0_eq[k0]    = (user_key_mem0[kpos_w[7:0]] == prev_user_key_mem[kpos_w[7:0]]);
     end endgenerate
-    wire chk_any_diff = |(chk_valid & ~chk_eq);
-    wire chk_all_done = (compare_index + CMP_CHUNK >= selected_user_key_len_w);
+    wire chk0_any_diff = |(chk0_valid & ~chk0_eq);
 
-    // ── OPT-C1a/C1b: Pipeline registers for comparator results ──
-    // OPT-C1b: cmp_pipe_valid is now combinational (not a toggle register).
-    // With CMP_CHUNK == MAX_USER_KEY_BYTES, comparison always finishes in 1
-    // iteration, so we only need "state stable for 1 cycle" → registered
-    // outputs are valid.  This saves 1 cycle per compare/check state entry.
+    wire [CMP_CHUNK-1:0] chk1_valid, chk1_eq;
+    genvar k1;
+    generate for (k1 = 0; k1 < CMP_CHUNK; k1 = k1 + 1) begin : g_chk1
+        wire [15:0] kpos_w = compare_index + k1;
+        assign chk1_valid[k1] = (kpos_w < user_key_len1);
+        assign chk1_eq[k1]    = (user_key_mem1[kpos_w[7:0]] == prev_user_key_mem[kpos_w[7:0]]);
+    end endgenerate
+    wire chk1_any_diff = |(chk1_valid & ~chk1_eq);
+
+    // ── OPT-C1a/C1b + P11: Pipeline registers for comparator results ──
     reg        chunk_found_r, chunk_lt_r, cmp01_all_done_r;
-    reg        chk_any_diff_r, chk_all_done_r;
+    reg        chk0_any_diff_r, chk1_any_diff_r;
     reg [3:0]  prev_state;
-    wire       cmp_pipe_valid = (prev_state == state) &&
-                                (state == ST_COMPARE_INPUTS || state == ST_CHECK_KEEP);
+    wire       cmp_pipe_valid = (prev_state == state) && (state == ST_CMP_SETUP);
+
+    // P11: Combinational source resolution & keep determination
+    reg        next_sel_src;
+    reg        next_sel_valid;
+    always @(*) begin
+        next_sel_src   = 1'b0;
+        next_sel_valid = 1'b0;
+        if (!buf_valid0) begin
+            next_sel_src   = 1'b1;
+            next_sel_valid = 1'b1;
+        end else if (!buf_valid1) begin
+            next_sel_src   = 1'b0;
+            next_sel_valid = 1'b1;
+        end else if (chunk_found_r) begin
+            next_sel_src   = chunk_lt_r ? 1'b0 : 1'b1;
+            next_sel_valid = 1'b1;
+        end else if (cmp01_all_done_r) begin
+            if (user_key_len0 != user_key_len1)
+                next_sel_src = (user_key_len0 < user_key_len1) ? 1'b0 : 1'b1;
+            else
+                next_sel_src = (tag0 >= tag1) ? 1'b0 : 1'b1;
+            next_sel_valid = 1'b1;
+        end
+    end
+    wire next_keep = !have_prev_user_key
+                   || (next_sel_src ? (user_key_len1 != prev_user_key_len)
+                                    : (user_key_len0 != prev_user_key_len))
+                   || (next_sel_src ? chk1_any_diff_r : chk0_any_diff_r);
+
+    // P14: Pre-computed dimensions for inlined FINALIZE (from registered sources)
+    wire [15:0] next_user_key_len_w = next_sel_src ? user_key_len1 : user_key_len0;
+    wire [15:0] next_key_len_w      = next_sel_src ? key_len1 : key_len0;
+    wire [15:0] next_value_len_w    = next_sel_src ? value_len1 : value_len0;
+    wire [63:0] next_tag_w          = next_sel_src ? tag1 : tag0;
 
     always @(posedge clk) begin
         if (!rstn || clear) begin
-            chunk_found_r   <= 1'b0;
-            chunk_lt_r      <= 1'b0;
+            chunk_found_r    <= 1'b0;
+            chunk_lt_r       <= 1'b0;
             cmp01_all_done_r <= 1'b0;
-            chk_any_diff_r  <= 1'b0;
-            chk_all_done_r  <= 1'b0;
-            prev_state      <= ST_IDLE;
+            chk0_any_diff_r  <= 1'b0;
+            chk1_any_diff_r  <= 1'b0;
+            prev_state       <= ST_IDLE;
         end else begin
             prev_state       <= state;
             chunk_found_r    <= chunk_found;
             chunk_lt_r       <= chunk_lt;
             cmp01_all_done_r <= cmp01_all_done;
-            chk_any_diff_r   <= chk_any_diff;
-            chk_all_done_r   <= chk_all_done;
+            chk0_any_diff_r  <= chk0_any_diff;
+            chk1_any_diff_r  <= chk1_any_diff;
         end
     end
 
@@ -366,6 +422,8 @@ module cmpct_merger #(
             have_prev_user_key       <= 1'b0;
             selected_source          <= 1'b0;
             keep_selected            <= 1'b0;
+            prefetched0              <= 1'b0;
+            prefetched1              <= 1'b0;
             prev_user_key_len        <= 16'd0;
             compare_index            <= 16'd0;
             emit_index               <= 32'd0;
@@ -411,6 +469,8 @@ module cmpct_merger #(
             have_prev_user_key       <= 1'b0;
             selected_source          <= 1'b0;
             keep_selected            <= 1'b0;
+            prefetched0              <= 1'b0;
+            prefetched1              <= 1'b0;
             prev_user_key_len        <= 16'd0;
             compare_index            <= 16'd0;
             emit_index               <= 32'd0;
@@ -451,7 +511,7 @@ module cmpct_merger #(
                 last_sequence            <= 56'd0;
                 last_value_type          <= 8'd0;
                 last_record_keep         <= 1'b0;
-                state                    <= ST_FETCH;
+                state                    <= ST_WAIT0_HEADER;
                 source_done_seen0        <= 1'b0;
                 source_done_seen1        <= 1'b0;
                 buf_valid0               <= 1'b0;
@@ -459,6 +519,8 @@ module cmpct_merger #(
                 have_prev_user_key       <= seed_prev_user_key_valid;
                 selected_source          <= 1'b0;
                 keep_selected            <= 1'b0;
+                prefetched0              <= 1'b0;
+                prefetched1              <= 1'b0;
                 prev_user_key_len        <= seed_prev_user_key_valid ? seed_prev_user_key_len : 16'd0;
                 compare_index            <= 16'd0;
                 emit_index               <= 32'd0;
@@ -482,24 +544,15 @@ module cmpct_merger #(
                 end
             end else if (busy && !error) begin
                 case (state)
-                    ST_FETCH: begin
-                        if (!buf_valid0 && !source_done_seen0) begin
-                            state <= ST_WAIT0_HEADER;
-                        end else if (!buf_valid1 && !source_done_seen1) begin
-                            state <= ST_WAIT1_HEADER;
-                        end else if (buf_valid0 || buf_valid1) begin
-                            compare_index <= 16'd0;
-                            state <= ST_COMPARE_INPUTS;
-                        end else begin
-                            busy  <= 1'b0;
-                            done  <= 1'b1;
-                            error <= 1'b0;
-                            state <= ST_IDLE;
-                        end
-                    end
+                    // P12: ST_FETCH eliminated — routing inlined at all call sites
 
                     ST_WAIT0_HEADER: begin
-                        if (input_accept0) begin
+                        if (prefetched0) begin
+                            // P10: header already accepted; skip to capture
+                            prefetched0   <= 1'b0;
+                            capture_index <= 32'd0;
+                            state         <= ST_CAPTURE0;
+                        end else if (input_accept0) begin
                             if ((s0_record_key_len < 16'd8) ||
                                 (s0_record_key_len > MAX_KEY_BYTES[15:0]) ||
                                 (s0_record_value_len > MAX_VALUE_BYTES[15:0]) ||
@@ -518,7 +571,15 @@ module cmpct_merger #(
                                 state          <= ST_CAPTURE0;
                             end
                         end else if (source_done_seen0) begin
-                            state <= ST_FETCH;
+                            // P12: inline ST_FETCH routing
+                            if (!buf_valid1 && !source_done_seen1)
+                                state <= ST_WAIT1_HEADER;
+                            else if (buf_valid1) begin
+                                compare_index <= 16'd0;
+                                state <= ST_CMP_SETUP;
+                            end else begin
+                                busy <= 1'b0; done <= 1'b1; state <= ST_IDLE;
+                            end
                         end
                     end
 
@@ -565,7 +626,7 @@ module cmpct_merger #(
                                         // OPT-MF2: skip ST_FETCH — route directly
                                         if (buf_valid1 || source_done_seen1) begin
                                             compare_index <= 16'd0;
-                                            state <= ST_COMPARE_INPUTS;
+                                            state <= ST_CMP_SETUP;
                                         end else begin
                                             state <= ST_WAIT1_HEADER;
                                         end
@@ -582,7 +643,12 @@ module cmpct_merger #(
                     end
 
                     ST_WAIT1_HEADER: begin
-                        if (input_accept1) begin
+                        if (prefetched1) begin
+                            // P10: header already accepted; skip to capture
+                            prefetched1   <= 1'b0;
+                            capture_index <= 32'd0;
+                            state         <= ST_CAPTURE1;
+                        end else if (input_accept1) begin
                             if ((s1_record_key_len < 16'd8) ||
                                 (s1_record_key_len > MAX_KEY_BYTES[15:0]) ||
                                 (s1_record_value_len > MAX_VALUE_BYTES[15:0]) ||
@@ -601,7 +667,15 @@ module cmpct_merger #(
                                 state          <= ST_CAPTURE1;
                             end
                         end else if (source_done_seen1) begin
-                            state <= ST_FETCH;
+                            // P12: inline ST_FETCH routing
+                            if (!buf_valid0 && !source_done_seen0)
+                                state <= ST_WAIT0_HEADER;
+                            else if (buf_valid0) begin
+                                compare_index <= 16'd0;
+                                state <= ST_CMP_SETUP;
+                            end else begin
+                                busy <= 1'b0; done <= 1'b1; state <= ST_IDLE;
+                            end
                         end
                     end
 
@@ -647,7 +721,7 @@ module cmpct_merger #(
                                         // OPT-MF2: skip ST_FETCH — route directly
                                         if (buf_valid0 || source_done_seen0) begin
                                             compare_index <= 16'd0;
-                                            state <= ST_COMPARE_INPUTS;
+                                            state <= ST_CMP_SETUP;
                                         end else begin
                                             state <= ST_WAIT0_HEADER;
                                         end
@@ -663,94 +737,61 @@ module cmpct_merger #(
                         end
                     end
 
-                    // OPT-C1a: chunk comparison uses registered pipeline
-                    ST_COMPARE_INPUTS: begin
-                        if (!buf_valid0) begin
-                            selected_source <= 1'b1;
+                    // P11+P14: Source select + duplicate check + FINALIZE inlined
+                    // Saves 1 cycle/record by eliminating separate ST_FINALIZE state.
+                    // Combinational depth: next_sel_src(3 LUT) → MUX(1) → counters (register)
+                    ST_CMP_SETUP: begin
+                        if (cmp_pipe_valid && next_sel_valid) begin
+                            // -- Former ST_FINALIZE logic, inlined --
+                            selected_source <= next_sel_src;
+                            keep_selected   <= next_keep;
                             compare_index   <= 16'd0;
-                            state           <= ST_CHECK_KEEP;
-                        end else if (!buf_valid1) begin
-                            selected_source <= 1'b0;
-                            compare_index   <= 16'd0;
-                            state           <= ST_CHECK_KEEP;
-                        end else if (cmp_pipe_valid) begin
-                            if (chunk_found_r) begin
-                                selected_source <= chunk_lt_r ? 1'b0 : 1'b1;
-                                compare_index   <= 16'd0;
-                                state           <= ST_CHECK_KEEP;
-                            end else if (cmp01_all_done_r) begin
-                                if (user_key_len0 != user_key_len1) begin
-                                    selected_source <= (user_key_len0 < user_key_len1) ? 1'b0 : 1'b1;
-                                end else begin
-                                    selected_source <= (tag0 >= tag1) ? 1'b0 : 1'b1;
-                                end
-                                compare_index <= 16'd0;
-                                state         <= ST_CHECK_KEEP;
+                            // Counter updates (use next_* wires based on next_sel_src)
+                            decoded_record_count <= decoded_record_count + 32'd1;
+                            user_key_bytes_total <= user_key_bytes_total + {16'd0, next_user_key_len_w};
+                            value_bytes_total    <= value_bytes_total + {16'd0, next_value_len_w};
+                            last_user_key_len    <= next_user_key_len_w;
+                            last_sequence        <= next_tag_w[63:8];
+                            last_value_type      <= next_tag_w[7:0];
+                            last_record_keep     <= next_keep;
+                            // OPT-T2: Register selected dimensions for emit/copy/drain
+                            sel_user_key_len_r   <= next_user_key_len_w;
+                            sel_key_len_r        <= next_key_len_w;
+                            sel_value_len_r      <= next_value_len_w;
+                            if (next_tag_w[7:0] == 8'h00) begin
+                                delete_record_count <= delete_record_count + 32'd1;
                             end else begin
-                                compare_index <= compare_index + CMP_CHUNK;
+                                value_record_count <= value_record_count + 32'd1;
                             end
-                        end
-                    end
-
-                    // OPT-C1a: duplicate check uses registered pipeline
-                    ST_CHECK_KEEP: begin
-                        if (!have_prev_user_key) begin
-                            keep_selected <= 1'b1;
-                            state         <= ST_FINALIZE;
-                        end else if (selected_user_key_len_w != prev_user_key_len) begin
-                            keep_selected <= 1'b1;
-                            state         <= ST_FINALIZE;
-                        end else if (cmp_pipe_valid) begin
-                            if (chk_any_diff_r) begin
-                                keep_selected <= 1'b1;
-                                state         <= ST_FINALIZE;
-                            end else if (chk_all_done_r) begin
-                                keep_selected <= 1'b0;
-                                state         <= ST_FINALIZE;
+                            if (next_keep) begin
+                                merged_record_count <= merged_record_count + 32'd1;
                             end else begin
-                                compare_index <= compare_index + CMP_CHUNK;
+                                dropped_superseded_count <= dropped_superseded_count + 32'd1;
                             end
-                        end
-                    end
-
-                    ST_FINALIZE: begin
-                        decoded_record_count <= decoded_record_count + 32'd1;
-                        user_key_bytes_total <= user_key_bytes_total + {16'd0, selected_user_key_len_w};
-                        value_bytes_total    <= value_bytes_total + {16'd0, selected_value_len_w};
-                        last_user_key_len    <= selected_user_key_len_w;
-                        last_sequence        <= selected_tag_w[63:8];
-                        last_value_type      <= selected_tag_w[7:0];
-                        last_record_keep     <= keep_selected;
-                        // OPT-T2: Register selected dimensions for emit/copy/drain phases
-                        sel_user_key_len_r   <= selected_user_key_len_w;
-                        sel_key_len_r        <= selected_key_len_w;
-                        sel_value_len_r      <= selected_value_len_w;
-                        if (selected_tag_w[7:0] == 8'h00) begin
-                            delete_record_count <= delete_record_count + 32'd1;
-                        end else begin
-                            value_record_count <= value_record_count + 32'd1;
-                        end
-                        if (keep_selected) begin
-                            merged_record_count <= merged_record_count + 32'd1;
-                        end else begin
-                            dropped_superseded_count <= dropped_superseded_count + 32'd1;
-                        end
-                        have_prev_user_key <= 1'b1;
-                        prev_user_key_len  <= selected_user_key_len_w;
-                        if (keep_selected) begin
-                            emit_index <= 32'd0;
-                            state      <= ST_EMIT_HEADER;
-                        end else begin
-                            // Drop path
-                            compare_index <= 16'd0;
-                            // OPT-MF2: overlap prev_key copy with value drain
-                            if (selected_value_len_w != 16'd0) begin
+                            have_prev_user_key <= 1'b1;
+                            prev_user_key_len  <= next_user_key_len_w;
+                            // State transition (skip ST_FINALIZE entirely)
+                            if (next_keep) begin
                                 emit_index <= 32'd0;
-                                state      <= ST_DRAIN_VALUE;
+                                state      <= ST_EMIT_HEADER;
                             end else begin
-                                state <= ST_COPY_PREV_KEY;
+                                // Drop path
+                                compare_index <= 16'd0;
+                                if (next_value_len_w != 16'd0) begin
+                                    emit_index <= 32'd0;
+                                    state      <= ST_DRAIN_VALUE;
+                                end else begin
+                                    state <= ST_COPY_PREV_KEY;
+                                end
                             end
+                        end else if (cmp_pipe_valid) begin
+                            compare_index <= compare_index + CMP_CHUNK;
                         end
+                    end
+
+                    // P14: ST_FINALIZE is now dead (kept for state encoding safety)
+                    ST_FINALIZE: begin
+                        busy <= 1'b0; error <= 1'b1; state <= ST_IDLE;
                     end
 
                     ST_EMIT_HEADER: begin
@@ -788,7 +829,7 @@ module cmpct_merger #(
                                             state <= ST_WAIT0_HEADER;
                                         else if (buf_valid1) begin
                                             compare_index <= 16'd0;
-                                            state <= ST_COMPARE_INPUTS;
+                                            state <= ST_CMP_SETUP;
                                         end else if (!source_done_seen1)
                                             state <= ST_WAIT1_HEADER;
                                         else begin
@@ -800,7 +841,7 @@ module cmpct_merger #(
                                             state <= ST_WAIT1_HEADER;
                                         else if (buf_valid0) begin
                                             compare_index <= 16'd0;
-                                            state <= ST_COMPARE_INPUTS;
+                                            state <= ST_CMP_SETUP;
                                         end else if (!source_done_seen0)
                                             state <= ST_WAIT0_HEADER;
                                         else begin
@@ -836,7 +877,7 @@ module cmpct_merger #(
                                     state <= ST_WAIT0_HEADER;
                                 else if (buf_valid1) begin
                                     compare_index <= 16'd0;
-                                    state <= ST_COMPARE_INPUTS;
+                                    state <= ST_CMP_SETUP;
                                 end else if (!source_done_seen1)
                                     state <= ST_WAIT1_HEADER;
                                 else begin
@@ -848,7 +889,7 @@ module cmpct_merger #(
                                     state <= ST_WAIT1_HEADER;
                                 else if (buf_valid0) begin
                                     compare_index <= 16'd0;
-                                    state <= ST_COMPARE_INPUTS;
+                                    state <= ST_CMP_SETUP;
                                 end else if (!source_done_seen0)
                                     state <= ST_WAIT0_HEADER;
                                 else begin
@@ -869,7 +910,7 @@ module cmpct_merger #(
                                         state <= ST_WAIT0_HEADER;
                                     else if (buf_valid1) begin
                                         compare_index <= 16'd0;
-                                        state <= ST_COMPARE_INPUTS;
+                                        state <= ST_CMP_SETUP;
                                     end else if (!source_done_seen1)
                                         state <= ST_WAIT1_HEADER;
                                     else begin
@@ -881,7 +922,7 @@ module cmpct_merger #(
                                         state <= ST_WAIT1_HEADER;
                                     else if (buf_valid0) begin
                                         compare_index <= 16'd0;
-                                        state <= ST_COMPARE_INPUTS;
+                                        state <= ST_CMP_SETUP;
                                     end else if (!source_done_seen0)
                                         state <= ST_WAIT0_HEADER;
                                     else begin
@@ -926,7 +967,7 @@ module cmpct_merger #(
                                             state <= ST_WAIT0_HEADER;
                                         else if (buf_valid1) begin
                                             compare_index <= 16'd0;
-                                            state <= ST_COMPARE_INPUTS;
+                                            state <= ST_CMP_SETUP;
                                         end else if (!source_done_seen1)
                                             state <= ST_WAIT1_HEADER;
                                         else begin
@@ -938,7 +979,7 @@ module cmpct_merger #(
                                             state <= ST_WAIT1_HEADER;
                                         else if (buf_valid0) begin
                                             compare_index <= 16'd0;
-                                            state <= ST_COMPARE_INPUTS;
+                                            state <= ST_CMP_SETUP;
                                         end else if (!source_done_seen0)
                                             state <= ST_WAIT0_HEADER;
                                         else begin
@@ -958,6 +999,45 @@ module cmpct_merger #(
                         state <= ST_IDLE;
                     end
                 endcase
+
+                // P10: Pre-fetch source 0 header (after case — last-NB-wins on conflict)
+                if (p10_can_accept0 && s0_record_valid) begin
+                    if ((s0_record_key_len < 16'd8) ||
+                        (s0_record_key_len > MAX_KEY_BYTES[15:0]) ||
+                        (s0_record_value_len > MAX_VALUE_BYTES[15:0]) ||
+                        ({16'd0, s0_record_key_len} + {16'd0, s0_record_value_len} > MAX_RECORD_BYTES[31:0]) ||
+                        (s0_record_key_len - 16'd8 > MAX_USER_KEY_BYTES[15:0])) begin
+                        busy  <= 1'b0;
+                        error <= 1'b1;
+                        state <= ST_IDLE;
+                    end else begin
+                        key_len0       <= s0_record_key_len;
+                        value_len0     <= s0_record_value_len;
+                        user_key_len0  <= s0_record_key_len - 16'd8;
+                        payload_total0 <= {16'd0, s0_record_key_len} + {16'd0, s0_record_value_len};
+                        tag0           <= 64'd0;
+                        prefetched0    <= 1'b1;
+                    end
+                end
+                // P10: Pre-fetch source 1 header
+                if (p10_can_accept1 && s1_record_valid) begin
+                    if ((s1_record_key_len < 16'd8) ||
+                        (s1_record_key_len > MAX_KEY_BYTES[15:0]) ||
+                        (s1_record_value_len > MAX_VALUE_BYTES[15:0]) ||
+                        ({16'd0, s1_record_key_len} + {16'd0, s1_record_value_len} > MAX_RECORD_BYTES[31:0]) ||
+                        (s1_record_key_len - 16'd8 > MAX_USER_KEY_BYTES[15:0])) begin
+                        busy  <= 1'b0;
+                        error <= 1'b1;
+                        state <= ST_IDLE;
+                    end else begin
+                        key_len1       <= s1_record_key_len;
+                        value_len1     <= s1_record_value_len;
+                        user_key_len1  <= s1_record_key_len - 16'd8;
+                        payload_total1 <= {16'd0, s1_record_key_len} + {16'd0, s1_record_value_len};
+                        tag1           <= 64'd0;
+                        prefetched1    <= 1'b1;
+                    end
+                end
             end
         end
     end
@@ -980,14 +1060,14 @@ module cmpct_merger #(
     // ── Profiling counters (synthesis: optimized out if unconnected) ──
     `ifdef SIMULATION
     reg [31:0] prof_wait0, prof_wait1, prof_cap0, prof_cap1;
-    reg [31:0] prof_compare, prof_check, prof_finalize;
+    reg [31:0] prof_compare, prof_finalize;  // P14: prof_finalize should stay 0
     reg [31:0] prof_emit_hdr, prof_emit_pay, prof_stream_val;
     reg [31:0] prof_drain_val, prof_copy_key, prof_idle;
     always @(posedge clk) begin
         if (!rstn || clear || (start && !busy)) begin
             prof_wait0 <= 0; prof_wait1 <= 0;
             prof_cap0  <= 0; prof_cap1  <= 0;
-            prof_compare <= 0; prof_check <= 0;
+            prof_compare <= 0;
             prof_finalize <= 0; prof_emit_hdr <= 0;
             prof_emit_pay <= 0; prof_stream_val <= 0;
             prof_drain_val <= 0; prof_copy_key <= 0;
@@ -998,9 +1078,8 @@ module cmpct_merger #(
                 ST_WAIT1_HEADER:   prof_wait1     <= prof_wait1 + 1;
                 ST_CAPTURE0:       prof_cap0      <= prof_cap0 + 1;
                 ST_CAPTURE1:       prof_cap1      <= prof_cap1 + 1;
-                ST_COMPARE_INPUTS: prof_compare   <= prof_compare + 1;
-                ST_CHECK_KEEP:     prof_check     <= prof_check + 1;
-                ST_FINALIZE:       prof_finalize  <= prof_finalize + 1;
+                ST_CMP_SETUP:      prof_compare   <= prof_compare + 1;
+                ST_FINALIZE:       prof_finalize  <= prof_finalize + 1;  // dead
                 ST_EMIT_HEADER:    prof_emit_hdr  <= prof_emit_hdr + 1;
                 ST_EMIT_PAYLOAD:   prof_emit_pay  <= prof_emit_pay + 1;
                 ST_STREAM_VALUE:   prof_stream_val<= prof_stream_val + 1;

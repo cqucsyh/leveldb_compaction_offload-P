@@ -21,6 +21,8 @@ RTL_FILES=(
     "${RTL}/cmpct_block_encoder.v"
     "${RTL}/cmpct_source_pipe.v"
     "${RTL}/cmpct_desc_matcher.v"
+    "${RTL}/byte_skip_adapter_w64.v"
+    "${RTL}/stream_byte_packer_64.v"
 )
 
 PASS=0

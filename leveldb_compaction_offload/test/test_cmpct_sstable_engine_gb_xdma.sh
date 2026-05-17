@@ -305,11 +305,11 @@ PROCESSED_MB="$(python3 -c "print(f'{${TOTAL_BYTES}/1024/1024:.2f}')")"
 WALL_S="$(python3 -c "print(f'{${WALL_MS}/1000:.2f}')")"
 HOST_THRU="$(python3 -c "print(f'{${TOTAL_BYTES}/1024/1024/(${WALL_MS}/1000):.2f}')" 2>/dev/null || echo "N/A")"
 AVG_CYC=$(( TOTAL_CYC / (PASS_COUNT > 0 ? PASS_COUNT : 1) ))
-HW_US="$(python3 -c "print(f'{${AVG_CYC}/200:.1f}')")"   # assume 200 MHz
+HW_US="$(python3 -c "print(f'{${AVG_CYC}/300:.1f}')")"   # assume 300 MHz
 HW_THRU="$(python3 -c "
 cyc=${AVG_CYC}; inp=${INPUT_PER_RUN}
 if cyc > 0:
-    us = cyc / 200.0  # 200 MHz → µs
+    us = cyc / 300.0  # 300 MHz → µs
     print(f'{inp / 1024 / 1024 / (us / 1e6):.1f}')
 else:
     print('N/A')
@@ -324,7 +324,7 @@ echo "  Data processed:  ${PROCESSED_MB} MB"
 echo "  Wall time:       ${WALL_S} s"
 echo "  Host throughput: ${HOST_THRU} MB/s  (incl. XDMA + reg overhead)"
 echo "  Avg HW cycles:   ${AVG_CYC} cycles/run"
-echo "  Avg HW time:     ${HW_US} µs/run  (@200MHz)"
+echo "  Avg HW time:     ${HW_US} µs/run  (@300MHz)"
 echo "  HW throughput:   ${HW_THRU} MB/s  (pure hardware)"
 echo "  Input per run:   ${INPUT_PER_RUN} bytes"
 echo "  Blocks per run:  ${EXP_PAIRS} pairs"

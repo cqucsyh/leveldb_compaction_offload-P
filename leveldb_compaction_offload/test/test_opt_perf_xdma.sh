@@ -6,7 +6,7 @@
 #
 # Phase 1 — Correctness: single run with full counter + output verification
 # Phase 2 — Throughput:  tight loop accumulating ~1 GB of data, measuring
-#           pure HW cycles (REG_PERF_CYCLES @200 MHz) and wall-clock time.
+#           pure HW cycles (REG_PERF_CYCLES @300 MHz) and wall-clock time.
 #
 # Fixtures: /home/yh/pp4/fixtures_gb  (200-block, 4000-record pair)
 #
@@ -35,7 +35,7 @@ MID_SIZE="0x00100000"
 AXIL_BASE="0x00000000"
 
 TARGET_MB=1024          # default 1 GB
-CLK_MHZ=200             # hardware clock frequency
+CLK_MHZ=300             # hardware clock frequency
 
 # ── Register map ──────────────────────────────────────────────────────────
 R_CTRL="0x0000";     R_STATUS="0x0004"
@@ -370,7 +370,7 @@ print()
 print('================================================================')
 print('  OPT BITSTREAM — GB THROUGHPUT BENCHMARK RESULTS')
 print('================================================================')
-print(f'  Optimizations:   P4b + OPT-HF + OPT-PKR')
+print(f'  Optimizations:   P4b + OPT-HF + OPT-PKR + P10 + P11 + P12')
 print(f'  Clock:           {freq_mhz} MHz')
 print()
 print(f'  Runs:            {pass_count} pass / {fail_count} fail / {total_runs} total')

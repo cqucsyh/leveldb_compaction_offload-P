@@ -61,9 +61,9 @@ module cmpct_block_encoder #(
     localparam [3:0] ST_IDLE            = 4'd0;
     localparam [3:0] ST_WAIT_RECORD     = 4'd1;
     localparam [3:0] ST_RECV_KEY        = 4'd2;
-    localparam [3:0] ST_WRITE_SHARED    = 4'd3;
-    localparam [3:0] ST_WRITE_UNSHARED  = 4'd4;
-    localparam [3:0] ST_WRITE_VALUE_LEN = 4'd5;
+    localparam [3:0] ST_WRITE_VARINTS  = 4'd3;  // P13: combined varint emission
+    localparam [3:0] ST_WRITE_VARINTS_OVF = 4'd4;  // P13: overflow (total > 8 bytes, rare)
+    localparam [3:0] ST_WRITE_VALUE_LEN = 4'd5;  // P13: dead state (kept for encoding)
     localparam [3:0] ST_WRITE_KEY       = 4'd6;
     localparam [3:0] ST_STREAM_VALUE    = 4'd7;
     localparam [3:0] ST_APPEND_RESTARTS = 4'd8;
@@ -205,6 +205,66 @@ module cmpct_block_encoder #(
     wire [2:0] shared_vlen   = varint32_len({16'd0, current_shared_len});
     wire [2:0] unshared_vlen = varint32_len({16'd0, current_unshared_len});
     wire [2:0] value_vlen    = varint32_len({16'd0, current_value_len});
+
+    // =========================================================================
+    // P13: Combined varint packing (timing-friendly, from registered lengths)
+    // Packs shared_varint || unshared_varint || value_varint into one 64-bit word.
+    // Max total: 5+5+5=15 bytes; typical: 1+1+1=3 or 1+1+2=4.
+    // Overflow (total > 8) handled by ST_WRITE_VARINTS_OVF.
+    // =========================================================================
+    wire [3:0] p13_offs_u = {1'b0, shared_vlen};
+    wire [3:0] p13_offs_v = {1'b0, shared_vlen} + {1'b0, unshared_vlen};
+    wire [3:0] p13_total  = p13_offs_v + {1'b0, value_vlen};
+    wire       p13_ovf    = (p13_total > 4'd8);
+
+    // Individual varint byte extracts (max 5 bytes each, LSB-first)
+    wire [39:0] p13_sv = shared_packed[39:0];
+    wire [39:0] p13_uv = unshared_packed[39:0];
+    wire [39:0] p13_vv = value_packed[39:0];
+
+    // Build combined 120-bit buffer using position muxes (5:1 and 9:1)
+    // Stage 1: shared at position 0 (no shift needed)
+    // Stage 2: unshared shifted by shared_vlen bytes
+    // Stage 3: value shifted by (shared_vlen + unshared_vlen) bytes
+    reg [119:0] p13_combined;
+    always @(*) begin
+        p13_combined = {80'd0, p13_sv};
+        case (p13_offs_u[2:0])
+            3'd1: p13_combined[47:8]    = p13_combined[47:8]   | {p13_uv};
+            3'd2: p13_combined[55:16]   = p13_combined[55:16]  | {p13_uv};
+            3'd3: p13_combined[63:24]   = p13_combined[63:24]  | {p13_uv};
+            3'd4: p13_combined[71:32]   = p13_combined[71:32]  | {p13_uv};
+            default: p13_combined[79:40] = p13_combined[79:40] | {p13_uv};
+        endcase
+        case (p13_offs_v)
+            4'd2:  p13_combined[55:16]   = p13_combined[55:16]   | {p13_vv};
+            4'd3:  p13_combined[63:24]   = p13_combined[63:24]   | {p13_vv};
+            4'd4:  p13_combined[71:32]   = p13_combined[71:32]   | {p13_vv};
+            4'd5:  p13_combined[79:40]   = p13_combined[79:40]   | {p13_vv};
+            4'd6:  p13_combined[87:48]   = p13_combined[87:48]   | {p13_vv};
+            4'd7:  p13_combined[95:56]   = p13_combined[95:56]   | {p13_vv};
+            4'd8:  p13_combined[103:64]  = p13_combined[103:64]  | {p13_vv};
+            4'd9:  p13_combined[111:72]  = p13_combined[111:72]  | {p13_vv};
+            default: p13_combined[119:80] = p13_combined[119:80] | {p13_vv};
+        endcase
+    end
+
+    wire [63:0] p13_data_lo = p13_combined[63:0];
+    wire [63:0] p13_data_hi = p13_combined[119:56]; // bytes 7-14 (for overflow)
+    wire [7:0]  p13_keep_lo = (p13_total >= 4'd8) ? 8'hff :
+                              (p13_total == 4'd7) ? 8'h7f :
+                              (p13_total == 4'd6) ? 8'h3f :
+                              (p13_total == 4'd5) ? 8'h1f :
+                              (p13_total == 4'd4) ? 8'h0f :
+                              (p13_total == 4'd3) ? 8'h07 :
+                              (p13_total == 4'd2) ? 8'h03 : 8'h01;
+    wire [3:0]  p13_hi_len  = p13_total - 4'd8;
+    wire [7:0]  p13_keep_hi = (p13_hi_len >= 4'd7) ? 8'h7f :
+                              (p13_hi_len == 4'd6) ? 8'h3f :
+                              (p13_hi_len == 4'd5) ? 8'h1f :
+                              (p13_hi_len == 4'd4) ? 8'h0f :
+                              (p13_hi_len == 4'd3) ? 8'h07 :
+                              (p13_hi_len == 4'd2) ? 8'h03 : 8'h01;
 
     // =========================================================================
     // P7: 8-way prefix comparison (combinational, chain structure)
@@ -369,7 +429,7 @@ module cmpct_block_encoder #(
 
                         if (s_record_key_len == 16'd0) begin
                             current_unshared_len <= 16'd0;
-                            state <= ST_WRITE_SHARED;
+                            state <= ST_WRITE_VARINTS;  // P13
                         end else begin
                             state <= ST_RECV_KEY;
                         end
@@ -411,50 +471,52 @@ module cmpct_block_encoder #(
                         recv_idx <= recv_idx + {12'd0, in_bytes};
 
                         if (recv_idx + {12'd0, in_bytes} >= current_key_len) begin
-                            state <= ST_WRITE_SHARED;
+                            // P13: Pre-compute unshared_len (saves 1 cycle in varint state)
+                            current_unshared_len <= current_key_len - new_shared_len;
+                            state <= ST_WRITE_VARINTS;
                         end
                     end
                 end
 
                 // =============================================================
-                // P7: Emit full varint in 1 cycle (64-bit word)
-                ST_WRITE_SHARED: begin
-                    // Compute unshared_len on entry (shared_len is final)
-                    current_unshared_len <= current_key_len - current_shared_len;
-
+                // P13: Combined varint emission — all 3 varints in 1 cycle
+                // Inputs: current_shared_len, current_unshared_len, current_value_len
+                // (all registered, stable on entry to this state)
+                ST_WRITE_VARINTS: begin
                     if (block_write_index >= MAX_BLOCK_BYTES) begin
                         busy <= 1'b0; error <= 1'b1; state <= ST_IDLE;
                     end else if (can_emit) begin
-                        emit_data  <= shared_packed[63:0];
-                        emit_keep  <= shared_packed[71:64];
+                        emit_data  <= p13_data_lo;
+                        emit_keep  <= p13_keep_lo;
                         emit_valid <= 1'b1;
-                        block_write_index <= block_write_index + {29'd0, shared_vlen};
-                        state <= ST_WRITE_UNSHARED;
+                        if (p13_ovf) begin
+                            // Rare: total > 8 bytes; emit first 8, then remainder
+                            block_write_index <= block_write_index + 32'd8;
+                            state <= ST_WRITE_VARINTS_OVF;
+                        end else begin
+                            // Common: all varints fit in 1 word
+                            block_write_index <= block_write_index + {28'd0, p13_total};
+                            block_copy_idx <= 16'd0;
+                            if (current_unshared_len == 16'd0) begin
+                                value_rem <= {16'd0, current_value_len};
+                                state <= ST_STREAM_VALUE;
+                            end else begin
+                                state <= ST_WRITE_KEY;
+                            end
+                        end
                     end
                 end
 
                 // =============================================================
-                ST_WRITE_UNSHARED: begin
+                // P13: Overflow — emit remaining varint bytes (total was > 8)
+                ST_WRITE_VARINTS_OVF: begin
                     if (block_write_index >= MAX_BLOCK_BYTES) begin
                         busy <= 1'b0; error <= 1'b1; state <= ST_IDLE;
                     end else if (can_emit) begin
-                        emit_data  <= unshared_packed[63:0];
-                        emit_keep  <= unshared_packed[71:64];
+                        emit_data  <= p13_data_hi;
+                        emit_keep  <= p13_keep_hi;
                         emit_valid <= 1'b1;
-                        block_write_index <= block_write_index + {29'd0, unshared_vlen};
-                        state <= ST_WRITE_VALUE_LEN;
-                    end
-                end
-
-                // =============================================================
-                ST_WRITE_VALUE_LEN: begin
-                    if (block_write_index >= MAX_BLOCK_BYTES) begin
-                        busy <= 1'b0; error <= 1'b1; state <= ST_IDLE;
-                    end else if (can_emit) begin
-                        emit_data  <= value_packed[63:0];
-                        emit_keep  <= value_packed[71:64];
-                        emit_valid <= 1'b1;
-                        block_write_index <= block_write_index + {29'd0, value_vlen};
+                        block_write_index <= block_write_index + {28'd0, p13_hi_len};
                         block_copy_idx <= 16'd0;
                         if (current_unshared_len == 16'd0) begin
                             value_rem <= {16'd0, current_value_len};
@@ -463,6 +525,11 @@ module cmpct_block_encoder #(
                             state <= ST_WRITE_KEY;
                         end
                     end
+                end
+
+                // P13: ST_WRITE_VALUE_LEN kept as dead state for encoding safety
+                ST_WRITE_VALUE_LEN: begin
+                    busy <= 1'b0; error <= 1'b1; state <= ST_IDLE;
                 end
 
                 // =============================================================
@@ -580,28 +647,27 @@ module cmpct_block_encoder #(
 
     // ── Profiling counters (synthesis: optimized out if unconnected) ──
     `ifdef SIMULATION
-    reg [31:0] prof_wait_rec, prof_recv_key, prof_write_sh, prof_write_unsh;
-    reg [31:0] prof_write_vlen, prof_write_key, prof_stream_val;
+    reg [31:0] prof_wait_rec, prof_recv_key, prof_write_varints, prof_write_varints_ovf;
+    reg [31:0] prof_write_key, prof_stream_val;
     reg [31:0] prof_append_rst, prof_append_cnt, prof_finish;
     always @(posedge clk) begin
         if (!rstn || clear || (start && !busy)) begin
             prof_wait_rec <= 0; prof_recv_key <= 0;
-            prof_write_sh <= 0; prof_write_unsh <= 0;
-            prof_write_vlen <= 0; prof_write_key <= 0;
+            prof_write_varints <= 0; prof_write_varints_ovf <= 0;
+            prof_write_key <= 0;
             prof_stream_val <= 0; prof_append_rst <= 0;
             prof_append_cnt <= 0; prof_finish <= 0;
         end else if (busy) begin
             case (state)
-                ST_WAIT_RECORD:     prof_wait_rec  <= prof_wait_rec + 1;
-                ST_RECV_KEY:        prof_recv_key  <= prof_recv_key + 1;
-                ST_WRITE_SHARED:    prof_write_sh  <= prof_write_sh + 1;
-                ST_WRITE_UNSHARED:  prof_write_unsh<= prof_write_unsh + 1;
-                ST_WRITE_VALUE_LEN: prof_write_vlen<= prof_write_vlen + 1;
-                ST_WRITE_KEY:       prof_write_key <= prof_write_key + 1;
-                ST_STREAM_VALUE:    prof_stream_val<= prof_stream_val + 1;
-                ST_APPEND_RESTARTS: prof_append_rst<= prof_append_rst + 1;
-                ST_APPEND_RST_CNT:  prof_append_cnt<= prof_append_cnt + 1;
-                ST_FINISH:          prof_finish    <= prof_finish + 1;
+                ST_WAIT_RECORD:      prof_wait_rec  <= prof_wait_rec + 1;
+                ST_RECV_KEY:         prof_recv_key  <= prof_recv_key + 1;
+                ST_WRITE_VARINTS:    prof_write_varints <= prof_write_varints + 1;
+                ST_WRITE_VARINTS_OVF: prof_write_varints_ovf <= prof_write_varints_ovf + 1;
+                ST_WRITE_KEY:        prof_write_key <= prof_write_key + 1;
+                ST_STREAM_VALUE:     prof_stream_val<= prof_stream_val + 1;
+                ST_APPEND_RESTARTS:  prof_append_rst<= prof_append_rst + 1;
+                ST_APPEND_RST_CNT:   prof_append_cnt<= prof_append_cnt + 1;
+                ST_FINISH:           prof_finish    <= prof_finish + 1;
                 default: ;
             endcase
         end
